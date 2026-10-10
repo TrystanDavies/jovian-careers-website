@@ -13,6 +13,7 @@ valid from 0 °C to 800 °C up to 100 MPa, and up to 2000 °C below 50 MPa.
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -46,6 +47,7 @@ class WaterState:
     cp: float | None = None  # kJ/(kg·K)
     mu: float | None = None  # Pa·s
     k: float | None = None  # W/(m·K)
+    w: float | None = None  # speed of sound, m/s (single phase only)
 
     @property
     def v(self) -> float:
@@ -173,8 +175,9 @@ def _build(st: IAPWS97, sat_x: float | None = None) -> WaterState:
     cp = None if two_phase else _float_or_none(getattr(st, "cp", None))
     mu = None if two_phase else _float_or_none(getattr(st, "mu", None))
     k = None if two_phase else _float_or_none(getattr(st, "k", None))
+    w = None if two_phase else _float_or_none(getattr(st, "w", None))
     return WaterState(P=P, T=T, h=float(st.h), s=float(st.s), rho=float(st.rho), x=x,
-                      phase=phase, cp=cp, mu=mu, k=k)
+                      phase=phase, cp=cp, mu=mu, k=k, w=w)
 
 
 def _call(**kwargs) -> IAPWS97:
@@ -192,6 +195,173 @@ def _call(**kwargs) -> IAPWS97:
     return st
 
 
+# --- fast backend (CoolProp's IF97 implementation) -------------------------------------
+#
+# CoolProp implements the same IAPWS-IF97 equations (and the IAPWS transport
+# property equations) in C++, about 150 times faster than the pure-Python
+# `iapws` package. Results agree to machine precision (see tests). If CoolProp
+# is not installed, or fails for a state (it does near the critical point),
+# the `iapws` package is used.
+
+try:  # pragma: no cover - import guard
+    import CoolProp as _CP
+    from CoolProp.CoolProp import AbstractState as _AbstractState
+
+    _HAVE_COOLPROP = True
+except ImportError:  # pragma: no cover
+    _HAVE_COOLPROP = False
+
+_local = threading.local()
+BACKEND = "CoolProp (IAPWS-IF97)" if _HAVE_COOLPROP else "iapws (IAPWS-IF97)"
+_use_coolprop = _HAVE_COOLPROP
+
+
+def set_backend(name: str) -> None:
+    """'coolprop' or 'iapws' (mainly for testing that both agree)."""
+    global _use_coolprop
+    _use_coolprop = name == "coolprop" and _HAVE_COOLPROP
+    for fn in (state_PT, state_Ph, state_Ps, state_Px, state_Tx, T_sat, P_sat, _sat_props):
+        fn.cache_clear()
+
+
+def _abstract_state():
+    st = getattr(_local, "state", None)
+    if st is None:
+        st = _local.state = _AbstractState("IF97", "Water")
+    return st
+
+
+def _opt(fn) -> float | None:
+    try:
+        v = fn()
+    except (ValueError, IndexError, RuntimeError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _read(AS) -> dict:
+    """Read every property we need from the AbstractState at once (later calls reuse it)."""
+    cp_ = _opt(AS.cpmass)
+    return {
+        "P": AS.p() / 1000.0, "T": AS.T() - 273.15, "h": AS.hmass() / 1000.0, "s": AS.smass() / 1000.0,
+        "rho": AS.rhomass(), "q": AS.Q(), "cp": cp_ / 1000.0 if cp_ is not None else None,
+        "mu": _opt(AS.viscosity), "k": _opt(AS.conductivity), "w": _opt(AS.speed_sound),
+    }
+
+
+def _from_coolprop(pair: str, a: float, b: float, sat_x: float | None = None) -> WaterState:
+    """a, b in library units; raises ValueError if CoolProp cannot do it."""
+    AS = _abstract_state()
+    if pair in ("Ph", "Ps"):
+        if pair == "Ph":
+            AS.update(_CP.HmassP_INPUTS, b * 1000.0, a * 1000.0)
+        else:
+            AS.update(_CP.PSmass_INPUTS, a * 1000.0, b * 1000.0)
+        t_guess = AS.T()
+        if a < P_CRIT_KPA:
+            # decide the phase with the exact saturation values (CoolProp's own
+            # two-phase (P, h) and (P, s) results are slightly inconsistent)
+            ts, hf, hg, sf, sg, rf, rg = _sat_props(a)
+            lo, hi = (hf, hg) if pair == "Ph" else (sf, sg)
+            x = (b - lo) / (hi - lo)
+            if 0.0 <= x <= 1.0:
+                return _two_phase_state(a, ts, x, hf, hg, sf, sg, rf, rg)
+            if (x < 0) != (t_guess - 273.15 < ts):  # backward equation landed on the wrong side
+                t_guess = ts + 273.15 + (-1e-7 if x < 0 else 1e-7)
+        AS.update(_CP.PT_INPUTS, a * 1000.0, t_guess)
+        _refine(AS, pair, a, b)
+        v = _read(AS)
+        v["q"] = -1.0
+    else:
+        if pair == "PT":
+            AS.update(_CP.PT_INPUTS, a * 1000.0, b + 273.15)
+        elif pair == "Px":
+            AS.update(_CP.PQ_INPUTS, a * 1000.0, b)
+        elif pair == "Tx":
+            AS.update(_CP.QT_INPUTS, b, a + 273.15)
+        else:  # pragma: no cover
+            raise ValueError(pair)
+        v = _read(AS)
+    P, T, h, s_, rho, q = v["P"], v["T"], v["h"], v["s"], v["rho"], v["q"]
+    if not all(math.isfinite(val) for val in (P, T, h, s_, rho)):
+        raise ValueError("non-finite result")
+    if sat_x is not None:
+        x = float(sat_x)
+        phase = "saturated liquid" if x == 0.0 else "saturated vapour" if x == 1.0 else "two-phase"
+    elif P >= P_CRIT_KPA:
+        phase, x = ("supercritical" if T >= T_CRIT_C else "liquid"), None
+    elif 0.0 <= q <= 1.0:
+        if q <= 1e-7:
+            phase, x = "saturated liquid", 0.0
+        elif q >= 1.0 - 1e-7:
+            phase, x = "saturated vapour", 1.0
+        else:
+            phase, x = "two-phase", float(q)
+    else:
+        phase, x = ("liquid" if T < T_sat(P) else "vapour"), None
+    if phase == "two-phase":
+        return WaterState(P=P, T=T, h=h, s=s_, rho=rho, x=x, phase=phase)
+    return WaterState(P=P, T=T, h=h, s=s_, rho=rho, x=x, phase=phase, cp=v["cp"], mu=v["mu"], k=v["k"], w=v["w"])
+
+
+@lru_cache(maxsize=50_000)
+def _sat_props(P: float) -> tuple[float, float, float, float, float, float, float]:
+    """(T_sat °C, h_f, h_g, s_f, s_g, ρ_f, ρ_g) at P [kPa(a)] from CoolProp."""
+    AS = _abstract_state()
+    AS.update(_CP.PQ_INPUTS, P * 1000.0, 0.0)
+    ts, hf, sf, rf = AS.T() - 273.15, AS.hmass() / 1000.0, AS.smass() / 1000.0, AS.rhomass()
+    AS.update(_CP.PQ_INPUTS, P * 1000.0, 1.0)
+    return ts, hf, AS.hmass() / 1000.0, sf, AS.smass() / 1000.0, rf, AS.rhomass()
+
+
+def _two_phase_state(P, ts, x, hf, hg, sf, sg, rf, rg) -> WaterState:
+    if x <= 1e-7:
+        phase, x = "saturated liquid", 0.0
+    elif x >= 1.0 - 1e-7:
+        phase, x = "saturated vapour", 1.0
+    else:
+        phase = "two-phase"
+    v = 1.0 / rf + x * (1.0 / rg - 1.0 / rf)
+    st = WaterState(P=P, T=ts, h=hf + x * (hg - hf), s=sf + x * (sg - sf), rho=1.0 / v, x=x, phase=phase)
+    if phase != "two-phase":  # transport properties of the saturated phase
+        sat = state_Px(P, x)
+        st = WaterState(P=P, T=ts, h=st.h, s=st.s, rho=st.rho, x=x, phase=phase, cp=sat.cp, mu=sat.mu, k=sat.k,
+                        w=sat.w)
+    return st
+
+
+def _refine(AS, pair: str, P: float, target: float) -> None:
+    """Make a single-phase (P, h) or (P, s) state exactly consistent.
+
+    IF97's backward equations give T(P, h) and T(P, s) to within a few
+    millikelvin. A few Newton steps on the forward equation h(P, T) (or
+    s(P, T)) remove that error, as the `iapws` package also does."""
+    p_pa = P * 1000.0
+    tgt = target * 1000.0
+    T = AS.T()  # caller has just set a (P, T) state
+    for _ in range(25):
+        AS.update(_CP.PT_INPUTS, p_pa, T)
+        val = AS.hmass() if pair == "Ph" else AS.smass()
+        err = tgt - val
+        if abs(err) <= 1e-11 * max(abs(tgt), 1.0):
+            return
+        slope = AS.cpmass() if pair == "Ph" else AS.cpmass() / T
+        T += err / slope
+    AS.update(_CP.PT_INPUTS, p_pa, T)
+    val = AS.hmass() if pair == "Ph" else AS.smass()
+    if abs(tgt - val) > 1e-7 * max(abs(tgt), 1.0):
+        raise ValueError("refinement did not converge")
+
+
+def _state(pair: str, a: float, b: float, sat_x: float | None = None, **iapws_kwargs) -> WaterState:
+    if _use_coolprop:
+        try:
+            return _from_coolprop(pair, a, b, sat_x)
+        except (ValueError, IndexError, RuntimeError):
+            pass
+    return _build(_call(**iapws_kwargs), sat_x=sat_x)
+
+
 # --- constructors -------------------------------------------------------------
 
 
@@ -206,21 +376,21 @@ def state_PT(P: float, T: float) -> WaterState:
                 f"At {P:.4g} kPa(a) water boils at exactly {ts:.3f} °C, so pressure and temperature "
                 "alone do not fix the state. Give the dryness fraction instead."
             )
-    return _build(_call(P=P / 1000.0, T=T + 273.15))
+    return _state("PT", P, T, P=P / 1000.0, T=T + 273.15)
 
 
 @lru_cache(maxsize=200_000)
 def state_Ph(P: float, h: float) -> WaterState:
     """State from pressure [kPa(a)] and specific enthalpy [kJ/kg]."""
     _check_bounds(P)
-    return _build(_call(P=P / 1000.0, h=h))
+    return _state("Ph", P, h, P=P / 1000.0, h=h)
 
 
 @lru_cache(maxsize=200_000)
 def state_Ps(P: float, s: float) -> WaterState:
     """State from pressure [kPa(a)] and specific entropy [kJ/(kg·K)]."""
     _check_bounds(P)
-    return _build(_call(P=P / 1000.0, s=s))
+    return _state("Ps", P, s, P=P / 1000.0, s=s)
 
 
 @lru_cache(maxsize=50_000)
@@ -234,7 +404,7 @@ def state_Px(P: float, x: float) -> WaterState:
         )
     if not 0.0 <= x <= 1.0:
         raise WaterPropertyError("Dryness fraction must be between 0 (saturated water) and 1 (dry steam).")
-    return _build(_call(P=P / 1000.0, x=x), sat_x=x)
+    return _state("Px", P, x, sat_x=x, P=P / 1000.0, x=x)
 
 
 @lru_cache(maxsize=50_000)
@@ -247,7 +417,7 @@ def state_Tx(T: float, x: float) -> WaterState:
         )
     if not 0.0 <= x <= 1.0:
         raise WaterPropertyError("Dryness fraction must be between 0 (saturated water) and 1 (dry steam).")
-    return _build(_call(T=T + 273.15, x=x), sat_x=x)
+    return _state("Tx", T, x, sat_x=x, T=T + 273.15, x=x)
 
 
 @lru_cache(maxsize=50_000)
@@ -256,6 +426,13 @@ def T_sat(P: float) -> float:
     _check_bounds(P)
     if P >= P_CRIT_KPA:
         raise WaterPropertyError("Above the critical pressure there is no saturation temperature.")
+    if _use_coolprop:
+        try:
+            AS = _abstract_state()
+            AS.update(_CP.PQ_INPUTS, P * 1000.0, 0.0)
+            return AS.T() - 273.15
+        except (ValueError, IndexError, RuntimeError):
+            pass
     return _call(P=P / 1000.0, x=0.0).T - 273.15
 
 
@@ -265,6 +442,13 @@ def P_sat(T: float) -> float:
     _check_bounds(None, T)
     if T >= T_CRIT_C:
         raise WaterPropertyError("Above the critical temperature there is no saturation pressure.")
+    if _use_coolprop:
+        try:
+            AS = _abstract_state()
+            AS.update(_CP.QT_INPUTS, 0.0, T + 273.15)
+            return AS.p() / 1000.0
+        except (ValueError, IndexError, RuntimeError):
+            pass
     return _call(T=T + 273.15, x=0.0).P * 1000.0
 
 

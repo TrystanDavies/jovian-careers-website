@@ -6,6 +6,8 @@ properties. Internal units: kPa(a), °C, kg/s, kJ/kg, kW.
 
 from __future__ import annotations
 
+import math
+
 from ..report import num, tex_text, unit
 from ..units import P_ATM_KPA, fmt
 from ..water import (
@@ -16,6 +18,7 @@ from ..water import (
     state_Ps,
     state_Px,
 )
+from ..hydraulics import characteristic, npsh_available, valve_cv_required, valve_outlet_pressure
 from .core import Block, Param, Port, allocate_outlets, register, requested_outflow
 
 TOL_P = 1e-6  # kPa
@@ -94,25 +97,54 @@ class Pump(Block):
     TYPE = "pump"
     LABEL = "Pump"
     CATEGORY = "Pressure change"
-    DESCRIPTION = "Raises the pressure of water, e.g. a boiler feed pump."
-    INLETS = [Port("in", "Inlet")]
-    OUTLETS = [Port("out", "Outlet")]
+    DESCRIPTION = ("Raises the pressure of water, e.g. a boiler feed pump. Specify the outlet pressure, the "
+                   "pressure rise, or a pump curve. Checks the suction head (NPSH).")
+    INLETS = [Port("in", "Suction")]
+    OUTLETS = [Port("out", "Discharge")]
     PARAMS = [
-        Param("outlet_pressure", "Outlet pressure", "pressure", 1301.325),
-        Param("efficiency", "Pump efficiency", "percent", 75.0, min_value=1.0, max_value=100.0,
-              help="Isentropic (hydraulic) efficiency."),
+        Param("mode", "Specify", "choice", "Outlet pressure",
+              choices=("Outlet pressure", "Pressure rise", "Pump curve")),
+        Param("outlet_pressure", "Outlet pressure", "pressure", 1301.325, show_if=("mode", ("Outlet pressure",))),
+        Param("pressure_rise", "Pressure rise", "pressure_diff", 1000.0, min_value=0.0,
+              show_if=("mode", ("Pressure rise",))),
+        Param("shutoff_head", "Shut-off head (zero flow)", "head", 150.0, min_value=0.0,
+              show_if=("mode", ("Pump curve",)), group="Pump curve"),
+        Param("rated_flow", "Rated flow (best efficiency point)", "volume_flow", 20.0, min_value=0.0,
+              show_if=("mode", ("Pump curve",)), group="Pump curve"),
+        Param("rated_head", "Head at rated flow", "head", 120.0, min_value=0.0,
+              show_if=("mode", ("Pump curve",)), group="Pump curve"),
+        Param("efficiency", "Pump efficiency (at rated flow for a curve)", "percent", 75.0, min_value=1.0,
+              max_value=100.0, help="Isentropic (hydraulic) efficiency."),
         Param("motor_efficiency", "Motor efficiency", "percent", 95.0, min_value=1.0, max_value=100.0),
+        Param("npshr", "NPSH required (0 = don't check)", "head", 0.0, min_value=0.0, group="Suction",
+              help="From the pump data sheet. Compared with the NPSH available at the suction."),
     ]
+
+    def _outlet_pressure(self, sin, st1):
+        mode = self.p("mode")
+        if mode == "Pressure rise":
+            return sin.P + self.p("pressure_rise"), self.p("efficiency") / 100.0, None
+        if mode == "Pump curve":
+            q = sin.m / st1.rho * 3600.0
+            h0, qr, hr = self.p("shutoff_head"), self.p("rated_flow"), self.p("rated_head")
+            if qr <= 0:
+                raise ValueError("Enter a rated flow greater than zero for the pump curve.")
+            r = q / qr
+            head = h0 - (h0 - hr) * r * r
+            if head <= 0:
+                raise ValueError(f"The flow ({fmt(q)} m³/h) is beyond the end of the pump curve (head falls to zero).")
+            eta = max(self.p("efficiency") / 100.0 * (2 * r - r * r), 0.05) if q > 0 else self.p("efficiency") / 100.0
+            return sin.P + st1.rho * 9.80665 * head / 1000.0, eta, (q, head, r)
+        return self.p("outlet_pressure"), self.p("efficiency") / 100.0, None
 
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
         st1 = sin.state
-        P2 = self.p("outlet_pressure")
+        P2, eta, curve = self._outlet_pressure(sin, st1)
         if P2 < sin.P - TOL_P:
             raise ValueError(f"Outlet pressure ({fmt(P2)} kPa(a)) is below the inlet pressure ({fmt(sin.P)} kPa(a)).")
         if st1.phase in ("vapour", "saturated vapour") or (st1.phase == "two-phase" and st1.x > 1e-4):
             self.warn("The pump inlet contains steam. Pumps need subcooled water to avoid cavitation.")
-        eta = self.p("efficiency") / 100.0
         eta_m = self.p("motor_efficiency") / 100.0
         h2s = state_Ps(P2, st1.s).h
         h2 = st1.h + (h2s - st1.h) / eta
@@ -121,10 +153,33 @@ class Pump(Block):
         st2 = out.state
         self.work_in = W
         head = (P2 - sin.P) * 1000.0 / (st1.rho * 9.80665)
+        q = sin.m / st1.rho * 3600.0
         self.result("power", "Shaft power", W, "power")
         self.result("electric", "Electrical power", W / eta_m, "power")
-        self.result("head", "Differential head (m)", head, "number")
+        self.result("dP", "Pressure rise", P2 - sin.P, "pressure_diff")
+        self.result("head", "Differential head", head, "head")
+        self.result("flow_vol", "Volumetric flow", q, "volume_flow")
+        self.result("eff", "Pump efficiency", eta * 100.0, "percent")
         self.result("dT", "Temperature rise", st2.T - st1.T, "temperature_diff")
+        npsha = npsh_available(st1)
+        if npsha is not None:
+            self.result("npsha", "NPSH available", npsha, "head")
+            npshr = self.p("npshr")
+            if npshr > 0 and npsha < npshr + 0.5:
+                self.warn(f"NPSH available ({fmt(npsha, 3)} m) is less than NPSH required plus a 0.5 m margin "
+                          f"({fmt(npshr + 0.5, 3)} m): the pump may cavitate. Raise the suction pressure or subcool "
+                          "the water.")
+        if curve is not None:
+            qv, hv, r = curve
+            self.step("Operating point on the pump curve",
+                      text=("The curve is a parabola through the shut-off head and the rated point. The efficiency "
+                            "falls away from the rated (best-efficiency) flow."),
+                      equation=(r"H = H_0 - (H_0 - H_r)\left(\frac{Q}{Q_r}\right)^2, \qquad "
+                                r"\eta = \eta_r\left[2\frac{Q}{Q_r} - \left(\frac{Q}{Q_r}\right)^2\right]"),
+                      substitution=(rf"H = {num(self.p('shutoff_head'), 4)} - ({num(self.p('shutoff_head'), 4)} - "
+                                    rf"{num(self.p('rated_head'), 4)})\left(\frac{{{num(qv, 4)}}}{{{num(self.p('rated_flow'), 4)}}}\right)^2"),
+                      result=rf"H = {num(hv, 4)}{unit('m')}, \quad \eta = {num(eta * 100, 3)}\,\%, \quad "
+                             rf"\Delta P = \rho g H = {num(P2 - sin.P, 4)}{unit('kPa')}")
         self.step("Isentropic compression",
                   text="The ideal (isentropic) outlet enthalpy is found at the outlet pressure and the inlet entropy.",
                   equation=r"h_{2s} = h(P_2,\ s_1)",
@@ -137,45 +192,71 @@ class Pump(Block):
                   equation=r"W = \dot m\,(h_2 - h_1), \qquad W_{elec} = W / \eta_{motor}",
                   substitution=rf"W = {num(sin.m, 5)} \times ({num(h2, 6)} - {num(st1.h, 6)})",
                   result=rf"W = {num(W, 5)}{unit('kW')}, \quad W_{{elec}} = {num(W / eta_m, 5)}{unit('kW')}")
+        if npsha is not None:
+            self.step("Net positive suction head available",
+                      text="Suction pressure above the vapour pressure, expressed as a head of water (velocity head neglected).",
+                      equation=r"NPSH_a = \frac{P_1 - P_v(T_1)}{\rho_1 g}",
+                      result=rf"NPSH_a = {num(npsha, 4)}{unit('m')}")
 
     def update_demands(self):
         self.pass_demand_through()
 
     def initial_guess(self, port):
         sin = self.s_in("in")
-        P2 = self.p("outlet_pressure")
         if sin.known:
+            try:
+                P2, _, _ = self._outlet_pressure(sin, sin.state)
+            except ValueError:
+                P2 = sin.P
             return P2, sin.h, sin.m
+        if self.p("mode") == "Outlet pressure":
+            return self.p("outlet_pressure"), state_Px(101.325, 0.0).h, 0.0
         return None
 
 
 @register
-class Valve(Block):
-    TYPE = "valve"
-    LABEL = "Valve / pressure-reducing valve"
+class Compressor(Block):
+    TYPE = "compressor"
+    LABEL = "Steam compressor"
     CATEGORY = "Pressure change"
-    DESCRIPTION = ("Reduces pressure with no heat or work exchanged (constant enthalpy), e.g. a pressure-reducing "
-                   "valve (PRV), control valve or steam trap.")
-    INLETS = [Port("in", "Inlet")]
-    OUTLETS = [Port("out", "Outlet")]
-    PARAMS = [Param("outlet_pressure", "Outlet pressure", "pressure", 201.325)]
+    DESCRIPTION = "Compresses steam to a higher pressure, e.g. mechanical vapour recompression (MVR)."
+    INLETS = [Port("in", "Suction")]
+    OUTLETS = [Port("out", "Discharge")]
+    PARAMS = [
+        Param("outlet_pressure", "Outlet pressure", "pressure", 401.325),
+        Param("efficiency", "Isentropic efficiency", "percent", 75.0, min_value=1.0, max_value=100.0),
+        Param("motor_efficiency", "Motor / drive efficiency", "percent", 95.0, min_value=1.0, max_value=100.0),
+    ]
 
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
+        st1 = sin.state
         P2 = self.p("outlet_pressure")
-        if P2 > sin.P + TOL_P:
-            raise ValueError(f"Outlet pressure ({fmt(P2)} kPa(a)) is above the inlet pressure ({fmt(sin.P)} kPa(a)).")
-        out.set(sin.m, P2, sin.h)
-        st1, st2 = sin.state, out.state
-        self.result("T_out", "Outlet temperature", st2.T, "temperature")
-        self.result("condition", "Outlet condition", st2.describe(), "text")
-        if st1.is_liquid_like and st2.phase == "two-phase":
-            self.result("flash", "Flash steam fraction", st2.x * 100.0, "percent")
-        self.step("Throttling at constant enthalpy",
-                  text=("No heat or work is exchanged, so the enthalpy does not change. "
-                        f"Inlet: {st1.describe().lower()}; outlet: {st2.describe().lower()}."),
-                  equation=r"h_2 = h_1",
-                  result=rf"h_2 = {_kj(st2.h)}, \quad T_2 = T({num(P2, 5)}{unit('kPa')},\ h_2) = {num(st2.T, 4)}{unit('°C')}")
+        if P2 <= sin.P + TOL_P:
+            raise ValueError(f"Outlet pressure ({fmt(P2)} kPa(a)) must be above the inlet pressure ({fmt(sin.P)} kPa(a)).")
+        if st1.is_liquid_like or (st1.phase == "two-phase" and st1.x < 0.98):
+            self.warn("The compressor inlet contains water droplets. Compressors need dry steam.")
+        eta = self.p("efficiency") / 100.0
+        eta_m = self.p("motor_efficiency") / 100.0
+        h2s = state_Ps(P2, st1.s).h
+        h2 = st1.h + (h2s - st1.h) / eta
+        out.set(sin.m, P2, h2)
+        st2 = out.state
+        W = sin.m * (h2 - st1.h)
+        self.work_in = W
+        self.result("power", "Shaft power", W, "power")
+        self.result("electric", "Electrical power", W / eta_m, "power")
+        self.result("ratio", "Pressure ratio", P2 / sin.P, "number")
+        self.result("T_out", "Discharge temperature", st2.T, "temperature")
+        self.result("condition", "Discharge condition", st2.describe(), "text")
+        self.step("Isentropic compression",
+                  equation=r"h_{2s} = h(P_2,\ s_1), \qquad h_2 = h_1 + \frac{h_{2s} - h_1}{\eta}",
+                  substitution=rf"h_2 = {num(st1.h, 6)} + \frac{{{num(h2s, 6)} - {num(st1.h, 6)}}}{{{num(eta, 3)}}}",
+                  result=rf"h_2 = {_kj(h2)}, \quad T_2 = {num(st2.T, 4)}{unit('°C')}")
+        self.step("Power",
+                  equation=r"W = \dot m\,(h_2 - h_1)",
+                  substitution=rf"W = {num(sin.m, 5)} \times ({num(h2, 6)} - {num(st1.h, 6)})",
+                  result=rf"W = {num(W, 5)}{unit('kW')}")
 
     def update_demands(self):
         self.pass_demand_through()
@@ -186,6 +267,140 @@ class Valve(Block):
         if sin.known:
             return P2, sin.h, sin.m
         return P2, state_Px(min(P2, P_CRIT_KPA - 1), 1.0).h, 0.0
+
+
+def _inverse_characteristic(fraction: float, kind: str, rangeability: float = 50.0) -> float:
+    """Opening (0–1) that gives a fraction of the rated Cv."""
+    f = min(max(fraction, 0.0), 1.0)
+    if kind == "Equal percentage":
+        return 1.0 + math.log(f) / math.log(rangeability) if f > 1.0 / rangeability else 0.0
+    if kind == "Quick opening":
+        return f * f
+    return f
+
+
+@register
+class Valve(Block):
+    TYPE = "valve"
+    LABEL = "Valve / control valve"
+    CATEGORY = "Pressure change"
+    DESCRIPTION = ("Reduces pressure at constant enthalpy: a pressure-reducing valve (PRV), control valve or steam "
+                   "trap. Specify the outlet pressure or pressure drop (the Cv needed is calculated), or the valve's "
+                   "Cv and opening (the pressure drop is calculated).")
+    INLETS = [Port("in", "Inlet")]
+    OUTLETS = [Port("out", "Outlet")]
+    PARAMS = [
+        Param("mode", "Specify", "choice", "Outlet pressure",
+              choices=("Outlet pressure", "Pressure drop", "Cv and opening")),
+        Param("outlet_pressure", "Outlet pressure", "pressure", 201.325, show_if=("mode", ("Outlet pressure",))),
+        Param("pressure_drop", "Pressure drop", "pressure_diff", 100.0, min_value=0.0,
+              show_if=("mode", ("Pressure drop",))),
+        Param("cv", "Rated Cv (fully open; 0 = not known)", "number", 0.0, min_value=0.0, group="Valve data",
+              help="US flow coefficient: US gallons per minute of water at 1 psi pressure drop."),
+        Param("opening", "Opening", "percent", 100.0, min_value=0.0, max_value=100.0,
+              show_if=("mode", ("Cv and opening",)), group="Valve data"),
+        Param("characteristic", "Characteristic", "choice", "Equal percentage",
+              choices=("Linear", "Equal percentage", "Quick opening"), group="Valve data"),
+        Param("fl", "Liquid pressure recovery factor FL", "number", 0.9, min_value=0.3, max_value=1.0,
+              group="Valve data"),
+        Param("xt", "Pressure differential ratio factor xT", "number", 0.7, min_value=0.1, max_value=1.0,
+              group="Valve data"),
+    ]
+
+    def _outlet(self, sin, st1):
+        mode = self.p("mode")
+        if mode == "Pressure drop":
+            return sin.P - self.p("pressure_drop"), None
+        if mode == "Cv and opening":
+            cv_rated = self.p("cv")
+            if cv_rated <= 0:
+                raise ValueError("Enter the valve's rated Cv to calculate the pressure drop.")
+            cv = cv_rated * characteristic(self.p("opening") / 100.0, self.p("characteristic"))
+            P2, sizing = valve_outlet_pressure(sin.m, st1, cv, self.p("fl"), self.p("xt"))
+            return P2, (cv, sizing)
+        return self.p("outlet_pressure"), None
+
+    def calculate(self):
+        sin, out = self.s_in("in"), self.s_out("out")
+        st1 = sin.state
+        P2, cv_mode = self._outlet(sin, st1)
+        if P2 <= 0:
+            raise ValueError("The pressure drop is larger than the inlet pressure.")
+        if P2 > sin.P + TOL_P:
+            raise ValueError(f"Outlet pressure ({fmt(P2)} kPa(a)) is above the inlet pressure ({fmt(sin.P)} kPa(a)).")
+        out.set(sin.m, P2, sin.h)
+        st2 = out.state
+        self.result("dP", "Pressure drop", sin.P - P2, "pressure_diff")
+        self.result("T_out", "Outlet temperature", st2.T, "temperature")
+        self.result("condition", "Outlet condition", st2.describe(), "text")
+        if st1.is_liquid_like and st2.phase == "two-phase":
+            self.result("flash", "Flash steam fraction", st2.x * 100.0, "percent")
+        self.step("Throttling at constant enthalpy",
+                  text=("No heat or work is exchanged, so the enthalpy does not change. "
+                        f"Inlet: {st1.describe().lower()}; outlet: {st2.describe().lower()}."),
+                  equation=r"h_2 = h_1",
+                  result=rf"h_2 = {_kj(st2.h)}, \quad T_2 = T({num(P2, 5)}{unit('kPa')},\ h_2) = {num(st2.T, 4)}{unit('°C')}")
+
+        # flow coefficient
+        if sin.m <= 0 or sin.P - P2 <= 1e-9:
+            return
+        if cv_mode is not None:
+            cv, sizing = cv_mode
+            self.result("cv", "Cv in use (rated × characteristic)", cv, "number")
+        else:
+            sizing = valve_cv_required(sin.m, st1, P2, self.p("fl"), self.p("xt"))
+            cv = sizing.cv
+            self.result("cv", "Cv required", cv, "number")
+            if self.p("cv") > 0:
+                frac = cv / self.p("cv")
+                if frac > 1.0:
+                    self.warn(f"The valve is too small: it needs Cv {fmt(cv, 3)} but its rated Cv is {fmt(self.p('cv'), 3)}.")
+                else:
+                    opening = _inverse_characteristic(frac, self.p("characteristic")) * 100.0
+                    self.result("opening", "Opening required", opening, "percent")
+                    if opening > 90:
+                        self.warn(f"The valve would be {fmt(opening, 3)} % open: little control margin left.")
+                    elif opening < 10:
+                        self.warn(f"The valve would be only {fmt(opening, 3)} % open: it is oversized for this duty.")
+        self.result("choked", "Choked flow", "Yes" if sizing.choked else "No", "text")
+        for note in sizing.notes:
+            self.warn(note)
+        W = sin.m * 3600.0
+        if sizing.regime == "liquid":
+            q = W / st1.rho
+            self.step("Flow coefficient (liquid, IEC 60534-2-1)",
+                      text=("Q in m³/h, ΔP in kPa, N1 = 0.0865. The usable pressure drop is limited by choking: "
+                            f"ΔP_max = FL²(P1 − FF·Pv) = {fmt(sizing.dp_choked)} kPa."),
+                      equation=r"C_v = \frac{Q}{N_1}\sqrt{\frac{\rho_1/\rho_0}{\Delta P}}",
+                      substitution=(rf"C_v = \frac{{{num(q, 5)}}}{{0.0865}}\sqrt{{\frac{{{num(st1.rho, 5)}/999}}"
+                                    rf"{{{num(min(sin.P - P2, sizing.dp_choked), 5)}}}}}"),
+                      result=rf"C_v = {num(cv, 4)}",
+                      reference="IEC 60534-2-1 / ISA-75.01.01")
+        else:
+            self.step("Flow coefficient (steam, IEC 60534-2-1)",
+                      text=("W in kg/h, P1 in kPa(a), ρ1 in kg/m³, N6 = 2.73. x is the pressure drop ratio "
+                            "(limited to Fγ·xT when choked) and Y the expansion factor."),
+                      equation=r"C_v = \frac{W}{N_6\,Y\sqrt{x\,P_1\,\rho_1}}, \qquad Y = 1 - \frac{x}{3F_\gamma x_T}",
+                      substitution=(rf"C_v = \frac{{{num(W, 5)}}}{{2.73 \times {num(sizing.y, 4)} \sqrt{{"
+                                    rf"{num(sizing.x_eff, 4)} \times {num(sin.P, 5)} \times {num(st1.rho, 4)}}}}}"),
+                      result=rf"C_v = {num(cv, 4)}",
+                      reference="IEC 60534-2-1 / ISA-75.01.01")
+
+    def update_demands(self):
+        self.pass_demand_through()
+
+    def initial_guess(self, port):
+        sin = self.s_in("in")
+        if sin.known:
+            try:
+                P2, _ = self._outlet(sin, sin.state)
+            except ValueError:
+                P2 = sin.P * 0.9
+            return P2, sin.h, sin.m
+        if self.p("mode") == "Outlet pressure":
+            P2 = self.p("outlet_pressure")
+            return P2, state_Px(min(P2, P_CRIT_KPA - 1), 1.0).h, 0.0
+        return None
 
 
 @register

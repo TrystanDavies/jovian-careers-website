@@ -3,6 +3,7 @@ equipment base class."""
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -16,10 +17,16 @@ from ..water import WaterState, state_Ph
 class Param:
     """An equipment setting shown in the user interface.
 
-    kind decides how the value is converted for display:
-      'pressure' (absolute kPa), 'pressure_diff' (kPa), 'temperature' (°C),
+    kind decides how the value is shown and converted for display:
+      numbers: 'pressure' (absolute kPa), 'pressure_diff' (kPa), 'temperature' (°C),
       'temperature_diff' (°C), 'mass_flow' (kg/s), 'power' (kW), 'percent',
-      'fraction' (0–1), 'choice', 'inlet_choice' (one of the block's inlet streams)
+      'fraction' (0–1), 'number', 'length' (m), 'diameter' (mm), 'roughness' (mm),
+      'head' (m), 'volume_flow' (m³/h), 'ua' (kW/K), 'htc' (W/m²K), 'conductivity' (W/mK)
+      other: 'choice', 'text', 'inlet_choice' (one of the block's inlet streams),
+      'stream_choice' / 'block_choice' (any stream / equipment in the flowsheet),
+      'param_choice' / 'result_choice' (a setting / result of the equipment chosen in
+      the setting named by depends_on), 'fittings' ({fitting: count}),
+      'target_value' (number whose unit follows the chosen target property)
     """
 
     key: str
@@ -32,6 +39,8 @@ class Param:
     min_value: float | None = None
     max_value: float | None = None
     inlet_port: str | None = None  # for kind 'inlet_choice'
+    group: str = ""  # heading the setting is shown under
+    depends_on: str | None = None  # for 'param_choice' / 'result_choice': the block-choice setting it refers to
 
 
 @dataclass(frozen=True)
@@ -83,11 +92,31 @@ class Stream:
 
 
 class SolveContext:
-    """Gives equipment access to its streams during a solve."""
+    """Gives equipment access to its streams (and the other equipment) during a solve."""
 
-    def __init__(self, streams: dict[str, Stream], final: bool = False):
+    def __init__(self, streams: dict[str, Stream], final: bool = False, blocks: dict | None = None):
         self.streams = streams
         self.final = final
+        self.blocks = blocks or {}
+
+
+# stream properties that Adjust and case studies can target: name -> (kind, getter)
+def _dryness(s: "Stream") -> float:
+    st = s.state
+    if st.x is not None:
+        return st.x
+    return 1.0 if st.is_vapour_like else 0.0
+
+
+STREAM_PROPERTIES: dict[str, tuple[str, Any]] = {
+    "Temperature": ("temperature", lambda s: s.state.T),
+    "Pressure": ("pressure", lambda s: s.P),
+    "Mass flow": ("mass_flow", lambda s: s.m),
+    "Dryness fraction": ("fraction", _dryness),
+    "Superheat": ("temperature_diff", lambda s: s.state.superheat or 0.0),
+    "Specific enthalpy": ("enthalpy", lambda s: s.h),
+    "Density": ("density", lambda s: s.state.rho),
+}
 
 
 class Block:
@@ -115,12 +144,12 @@ class Block:
         self.name = name
         self.inlets: dict[str, Any] = dict(inlets or {})
         self.outlets: dict[str, Any] = dict(outlets or {})
-        self.params: dict[str, Any] = {p.key: p.default for p in self.PARAMS}
+        self.params: dict[str, Any] = {p.key: copy.deepcopy(p.default) for p in self.PARAMS}
         if params:
             unknown = set(params) - set(self.params) - {"outlet_specs"}
             if unknown:
                 raise ValueError(f"{self.LABEL} '{name}': unknown setting(s) {sorted(unknown)}")
-            self.params.update(params)
+            self.params.update(copy.deepcopy(params))
         if any(p.with_specs for p in self.OUTLETS):
             self.params.setdefault("outlet_specs", {})
         self.results: dict[str, Result] = {}
@@ -128,7 +157,8 @@ class Block:
         self.warnings: list[str] = []
         self.error: str | None = None
         self.heat_in = 0.0  # kW added to the fluid as heat
-        self.work_in = 0.0  # kW added to the fluid as shaft work
+        self.work_in = 0.0  # kW added to the fluid as shaft work (or as potential/kinetic energy)
+        self.charts: dict[str, dict] = {}  # name -> {"x": label, "y": label, "series": {name: [(x, y)]}}
         self._ctx: SolveContext | None = None
 
     # --- connections --------------------------------------------------------
@@ -187,6 +217,7 @@ class Block:
         self.error = None
         self.heat_in = 0.0
         self.work_in = 0.0
+        self.charts = {}
 
     def calculate(self) -> None:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -227,13 +258,13 @@ class Block:
     # --- serialisation -------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {
+        return copy.deepcopy({
             "type": self.TYPE,
             "name": self.name,
             "inlets": self.inlets,
             "outlets": self.outlets,
             "params": self.params,
-        }
+        })
 
 
 BLOCK_TYPES: dict[str, type[Block]] = {}

@@ -82,3 +82,50 @@ def test_matches_coolprop_if97():
             st = state_PT(P, T)
             h_cp = CP.PropsSI("H", "P", P * 1000.0, "T", T + 273.15, "IF97::Water") / 1000.0
             assert st.h == pytest.approx(h_cp, rel=1e-6)
+
+
+def test_fast_backend_matches_iapws_package():
+    """CoolProp's IF97 (fast) and the iapws package agree away from the critical region."""
+    pytest.importorskip("CoolProp")
+    import random
+
+    from steamsuite import water
+
+    random.seed(7)
+    pts = [(random.uniform(1.0, 16000.0), random.uniform(60.0, 3500.0)) for _ in range(300)]
+
+    def run(backend):
+        water.set_backend(backend)
+        out = []
+        for P, h in pts:
+            try:
+                st = state_Ph(P, h)
+                out.append((st, state_Ps(P, st.s), state_PT(P, st.T) if st.x is None else None))
+            except WaterPropertyError:
+                out.append(None)
+        return out
+
+    try:
+        fast, ref = run("coolprop"), run("iapws")
+    finally:
+        water.set_backend("coolprop")
+    compared = 0
+    for a, b in zip(fast, ref):
+        assert (a is None) == (b is None)
+        if a is None:
+            continue
+        for x, y in zip(a, b):
+            if x is None:
+                continue
+            compared += 1
+            assert x.phase == y.phase
+            assert x.T == pytest.approx(y.T, abs=1e-6)
+            assert x.h == pytest.approx(y.h, rel=1e-9, abs=1e-9)
+            assert x.s == pytest.approx(y.s, rel=1e-9, abs=1e-9)
+            assert x.rho == pytest.approx(y.rho, rel=1e-7)
+            for prop in ("mu", "k", "w", "cp"):  # transport and derived properties
+                a_, b_ = getattr(x, prop), getattr(y, prop)
+                assert (a_ is None) == (b_ is None), prop
+                if a_ is not None:
+                    assert a_ == pytest.approx(b_, rel=1e-6), prop
+    assert compared > 600

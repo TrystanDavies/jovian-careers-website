@@ -20,10 +20,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
+from scipy.optimize import brentq
+
 from ..report import CalcReport, Step
 from ..units import fmt
 from ..water import P_CRIT_KPA, WaterPropertyError, state_Px, state_PT
-from .core import BLOCK_TYPES, Block, SolveContext, Stream
+from .core import BLOCK_TYPES, STREAM_PROPERTIES, Block, SolveContext, Stream
 
 
 @dataclass
@@ -43,6 +45,7 @@ class Flowsheet:
         self.blocks: dict[str, Block] = {}
         self.streams: dict[str, Stream] = {}
         self.estimates: dict[str, dict] = {}
+        self.layout: dict = {}  # drawing positions: {"nodes": {name: {x, y, rot, flip}}, "streams": {...}}
         self.result: SolveResult | None = None
 
     # --- building ------------------------------------------------------------
@@ -136,13 +139,198 @@ class Flowsheet:
 
     # --- solving --------------------------------------------------------------
 
-    def solve(self, max_iterations: int = 300, tolerance: float = 1e-9) -> SolveResult:
+    def solve(self, max_iterations: int = 300, tolerance: float = 1e-9, warm: bool = False) -> SolveResult:
+        """Solve the flowsheet, including any Adjust (goal-seek) operations.
+
+        warm=True starts from the previous solution (faster when only a setting changed)."""
+        adjusts = [b for b in self.blocks.values() if b.TYPE == "adjust"]
+        if not adjusts:
+            return self._solve_once(max_iterations, tolerance, warm, final=True)
+
+        first = self._solve_once(max_iterations, tolerance, warm, final=False)
+        messages: dict[str, tuple[str, str]] = {}  # adjust name -> ("error"|"ok", text)
+        info: dict[str, dict] = {}
+        if not first.errors:
+            active = []
+            for a in adjusts:
+                problem = self._check_adjust(a)
+                if problem:
+                    messages[a.name] = ("error", problem)
+                else:
+                    active.append(a)
+            rounds = 1 if len(active) <= 1 else 8
+            for _ in range(rounds):
+                all_met = True
+                for a in active:
+                    if messages.get(a.name, ("ok",))[0] == "error":
+                        continue
+                    try:
+                        info[a.name] = self._run_adjust(a, max_iterations, tolerance)
+                    except (ValueError, WaterPropertyError, ZeroDivisionError, RuntimeError) as exc:
+                        messages[a.name] = ("error", str(exc))
+                for a in active:
+                    if a.name in info and messages.get(a.name, ("ok",))[0] != "error":
+                        if abs(self._adjust_error(a)) > a.p("tolerance") * max(abs(a.p("target_value")), 1e-6) * 10:
+                            all_met = False
+                if all_met:
+                    break
+        result = self._solve_once(max_iterations, tolerance, warm=True, final=True)
+        for a in adjusts:
+            a.begin()
+            kind, text = messages.get(a.name, ("ok", ""))
+            if kind == "error":
+                a.error = text
+                result.errors.append(f"{a.name}: {text}")
+                continue
+            if a.name in info:
+                d = info[a.name]
+                blk = self.blocks[a.p("var_block")]
+                pdef = next(pp for pp in blk.PARAMS if pp.key == a.p("var_param"))
+                a.result("value", f"Adjusted: {blk.name} — {pdef.label}", blk.params[a.p("var_param")], pdef.kind)
+                a.result("achieved", "Target value reached", self.measure_target(a), a.target_kind(self.blocks))
+                a.result("evaluations", "Flowsheet solutions needed", d["evaluations"], "number")
+                a.step("Goal seek",
+                       text=(f"{blk.name} — {pdef.label} was varied until the target was met "
+                             f"({d['method']}, {d['evaluations']} flowsheet solutions)."),
+                       result=(rf"\text{{setting}} = {fmt(blk.params[a.p('var_param')], 6, sep=False)}, \quad "
+                               rf"\text{{target}} = {fmt(self.measure_target(a), 6, sep=False)}"))
+        result.converged = result.converged and not result.errors
+        self.result = result
+        return result
+
+    def _check_adjust(self, a: Block) -> str | None:
+        vb = self.blocks.get(a.p("var_block"))
+        if vb is None:
+            return "Choose the equipment to adjust."
+        pdef = next((pp for pp in vb.PARAMS if pp.key == a.p("var_param")), None)
+        if pdef is None or not isinstance(vb.params.get(pdef.key), (int, float)) or pdef.kind in ("choice", "text"):
+            return "Choose a numeric setting to adjust."
+        try:
+            self.measure_target(a)
+        except (KeyError, ValueError, TypeError) as exc:
+            return f"Choose a valid target ({exc})."
+        return None
+
+    def measure(self, kind: str, obj: str, prop: str) -> float:
+        """Value of a stream property or an equipment result (internal units)."""
+        if kind == "Stream property":
+            s = self.streams.get(obj)
+            if s is None or not s.known:
+                raise KeyError(f"stream '{obj}' not found")
+            return float(STREAM_PROPERTIES[prop][1](s))
+        b = self.blocks.get(obj)
+        if b is None:
+            raise KeyError(f"equipment '{obj}' not found")
+        r = b.results.get(prop)
+        if r is None or isinstance(r.value, str):
+            raise KeyError(f"'{obj}' has no numeric result '{prop}'")
+        return float(r.value)
+
+    def measure_target(self, a: Block) -> float:
+        if a.p("target_type") == "Stream property":
+            return self.measure("Stream property", a.p("target_stream"), a.p("target_property"))
+        return self.measure("Equipment result", a.p("target_block"), a.p("target_result"))
+
+    def _adjust_error(self, a: Block) -> float:
+        return self.measure_target(a) - float(a.p("target_value"))
+
+    def _run_adjust(self, a: Block, max_iterations: int, tolerance: float) -> dict:
+        blk = self.blocks[a.p("var_block")]
+        key = a.p("var_param")
+        target = float(a.p("target_value"))
+        tol = float(a.p("tolerance")) * max(abs(target), 1e-6)
+        count = {"n": 0}
+
+        def g(v: float) -> float:
+            blk.params[key] = float(v)
+            count["n"] += 1
+            r = self._solve_once(max_iterations, tolerance, warm=True, final=False)
+            if r.errors:
+                raise ValueError(f"with the setting at {fmt(v, 5)} the flowsheet fails: {r.errors[0]}")
+            return self._adjust_error(a)
+
+        lo, hi = float(a.p("lower")), float(a.p("upper"))
+        if hi > lo:
+            g_lo, g_hi = g(lo), g(hi)
+            if g_lo == 0:
+                root = lo
+            elif g_hi == 0:
+                root = hi
+            elif g_lo * g_hi > 0:
+                raise ValueError(f"No solution between the limits: the target varies from "
+                                 f"{fmt(g_lo + target, 5)} to {fmt(g_hi + target, 5)}, but {fmt(target, 5)} is wanted. "
+                                 "Widen the limits.")
+            else:
+                root = brentq(g, lo, hi, xtol=1e-12 * max(abs(lo), abs(hi), 1.0), rtol=1e-12, maxiter=100)
+            method = "Brent's method between the limits"
+        else:
+            x0 = float(blk.params[key])
+            x1 = x0 * 1.02 if x0 != 0 else 1.0
+            f0, f1 = g(x0), g(x1)
+            root = x1
+            for _ in range(60):
+                if abs(f1) <= tol:
+                    break
+                if f1 == f0:
+                    raise ValueError("The target does not change when the setting changes; choose another setting.")
+                x2 = x1 - f1 * (x1 - x0) / (f1 - f0)
+                x0, f0 = x1, f1
+                x1, f1 = x2, g(x2)
+                root = x1
+            else:
+                raise ValueError("The goal seek did not converge. Give lower and upper limits for the setting.")
+            method = "secant method from the current value"
+        blk.params[key] = float(root)
+        if abs(g(root)) > max(tol, 1e-9 * max(abs(target), 1.0)) * 10:
+            raise ValueError("The goal seek could not meet the target to the requested tolerance.")
+        return {"evaluations": count["n"], "method": method}
+
+    def case_study(self, block: str, param: str, values: list[float], outputs: list[dict]) -> list[dict]:
+        """Vary one setting over a list of values and record outputs.
+
+        outputs: [{"type": "Stream property"|"Equipment result", "object": name, "property": key}]
+        """
+        blk = self.blocks.get(block)
+        if blk is None or param not in blk.params:
+            raise ValueError("Choose the equipment and the setting to vary.")
+        original = blk.params[param]
+        rows = []
+        try:
+            for v in values:
+                blk.params[param] = float(v)
+                try:
+                    res = self.solve(warm=True)
+                except ValueError as exc:
+                    rows.append({"value": v, "ok": False, "error": str(exc), "outputs": [None] * len(outputs)})
+                    continue
+                ok = not res.errors
+                vals = []
+                for o in outputs:
+                    try:
+                        vals.append(self.measure(o["type"], o["object"], o["property"]) if ok else None)
+                    except (KeyError, ValueError):
+                        vals.append(None)
+                rows.append({"value": v, "ok": ok, "error": res.errors[0] if res.errors else None, "outputs": vals})
+        finally:
+            blk.params[param] = original
+            try:
+                self.solve(warm=True)
+            except ValueError:
+                pass
+        return rows
+
+    def _solve_once(self, max_iterations: int, tolerance: float, warm: bool, final: bool) -> SolveResult:
         if not self.blocks:
             raise ValueError("The flowsheet is empty. Add some equipment first.")
         for b in self.blocks.values():
             b.validate_ports()
+        previous = self._snapshot() if warm and self.streams else {}
         self._build_streams()
-        ctx = SolveContext(self.streams)
+        for n, vals in previous.items():
+            s = self.streams.get(n)
+            if s is not None and None not in vals[:3]:
+                s.m, s.P, s.h, s.demand = vals
+        ctx = SolveContext(self.streams, blocks=self.blocks)
         for b in self.blocks.values():
             b.bind(ctx)
         order = self._order()
@@ -174,14 +362,15 @@ class Flowsheet:
                 converged = True
                 break
 
-        # final pass: lets equipment add end-of-solve warnings
-        ctx.final = True
-        for b in order:
-            b.begin()
-            try:
-                b.calculate()
-            except (ValueError, WaterPropertyError, ZeroDivisionError) as exc:
-                b.error = str(exc)
+        if final:
+            # final pass: lets equipment add end-of-solve warnings and run final-only calculations
+            ctx.final = True
+            for b in order:
+                b.begin()
+                try:
+                    b.calculate()
+                except (ValueError, WaterPropertyError, ZeroDivisionError) as exc:
+                    b.error = str(exc)
 
         errors = [f"{b.name}: {b.error}" for b in self.blocks.values() if b.error]
         warnings = [f"{b.name}: {w}" for b in self.blocks.values() for w in b.warnings]
@@ -322,6 +511,7 @@ class Flowsheet:
             "description": self.description,
             "blocks": [b.to_dict() for b in self.blocks.values()],
             "estimates": self.estimates,
+            "layout": self.layout,
         }
 
     def to_json(self) -> str:
@@ -336,6 +526,7 @@ class Flowsheet:
                 raise ValueError(f"Unknown equipment type '{btype}'.")
             fs.add(BLOCK_TYPES[btype](bd["name"], bd.get("inlets"), bd.get("outlets"), bd.get("params")))
         fs.estimates = dict(data.get("estimates", {}))
+        fs.layout = dict(data.get("layout") or {})
         return fs
 
     @classmethod
