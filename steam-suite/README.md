@@ -1,123 +1,140 @@
 # Steam Suite
 
-Engineering tools for **water and steam systems**, with every calculation shown step by step:
+A **P&ID designer and steady-state simulator for water and steam systems**, in the spirit of Aspen HYSYS but
+focused on water and steam. Draw the plant by dragging equipment onto a P&ID and connecting nozzles; the
+simulator calculates the heat and mass balance and the pipe pressure drops as you draw. It also sizes control
+valves and relief valves. Every result can be opened to show the equations used, with the numbers substituted.
 
-| Tool | What it does |
+![P&ID designer with a steam distribution system](docs/images/designer-pipe.png)
+
+## What it does
+
+| Area | Capabilities |
 |---|---|
-| **Steam system simulator** | Build a plant from boilers, steam headers, turbines, pressure-reducing valves, desuperheaters, flash vessels, deaerators, pumps, heaters, condensers and process steam users. Solves the steady-state mass and energy balance, including recycle loops and "as required" flows (steam generation, make-up water, PRV flow, spray water and deaerator steam are found automatically). |
-| **Relief valve sizing** | Sizes pressure relief valves for saturated, superheated and wet steam, and hot water, including water that flashes to steam. API 520 Part I methods, API 526 orifice selection, and a printable step-by-step report. Any stream in the simulator can be sent straight to relief sizing. |
-| **Steam tables** | Water and steam properties (IAPWS-IF97) from any two known values, with the state shown on a temperature–entropy chart. |
+| **P&ID drawing** | Drag-and-drop palette of ISA-style symbols; connect nozzles by dragging; orthogonal pipe routing you can adjust; move, rotate, flip, copy/paste, duplicate, delete; undo/redo; pan and zoom; automatic tidy layout; stream data tags on every line (draggable); lines coloured by phase (steam, wet steam, water); export the drawing as SVG |
+| **Heat and mass balance** | Solves automatically after every change. Handles recycle loops and "as required" flows (a deaerator works out its heating steam and make-up water, a header asks its balancing supply for the shortfall, a condensing heater finds its steam flow). Overall mass and energy balance checks |
+| **Pressure drop** | Pipe segments: ASME B36.10M sizes and schedules, length, elevation change, roughness, Crane TP-410 fittings and valves, insulation heat loss. Water, steam (compressible) and two-phase flow (Müller-Steinhagen & Heck or homogeneous). Velocity, Mach number and erosional velocity checks; condensate formed by heat loss; flashing |
+| **Valves and pumps** | Control valves: Cv required and opening (IEC 60534), or the pressure drop from a given Cv and opening; choked flow, flashing and cavitation checks. Pumps: outlet pressure, pressure rise or a pump curve; NPSH available vs required |
+| **Heat exchangers** | Two-stream exchanger analysed in zones (correct for condensing and boiling); specify an outlet temperature, dryness, duty, UA (rating) or minimum approach; condensing-heater mode; temperature–duty (T–Q) diagram; temperature-cross detection |
+| **Relief valves** | Place a PSV on any line: it is sized to API 520 from that line's conditions, with an API 526 orifice. A stand-alone relief sizing page covers saturated, superheated and wet steam, and hot water including flashing |
+| **HYSYS-style tools** | Adjust (goal seek: vary one setting to hit a target); Case study (vary a setting over a range, table, charts and CSV); workbook of streams, equipment, piping and relief valves; downloadable calculation reports (HTML/Markdown) |
+| **Properties** | IAPWS-IF97 steam tables page with a temperature–entropy chart |
 
-Units can be metric (bar g, °C, t/h), SI (kPa a, kg/s) or US customary (psig, °F, lb/h), or mixed.
+Units: metric (bar g, °C, t/h), metric absolute, SI (kPa a, kg/s) or US customary (psig, °F, lb/h).
+
+### Equipment
+
+Water/steam supply · Pump · Steam compressor · Valve / control valve · Steam turbine · Boiler · Heater/cooler ·
+Heat exchanger · Condenser · Pipe segment · Mixer · Splitter · Steam header · Flash vessel · Desuperheater ·
+Deaerator / open feedwater heater · Process steam user · Pressure relief valve (PSV) · Adjust (goal seek)
 
 > **Important:** these are preliminary engineering calculations. Results used for design, and especially for
 > pressure relief, must be checked by a qualified engineer against the codes and editions that apply to your
-> equipment, using the valve manufacturer's certified data.
+> equipment, using manufacturers' certified data.
 
-## Quick start
+## Getting started
 
 ```bash
 cd steam-suite
 python -m pip install -r requirements.txt
-streamlit run app/streamlit_app.py
+python -m steamsuite.web
 ```
 
-The app opens in your browser at http://localhost:8501. Then:
+Your browser opens at http://localhost:8000 with an example loaded. Then:
 
-1. Pick your units in the sidebar.
-2. Open **Steam system simulator**. The *Industrial steam system* example is loaded; explore the
-   **Diagram**, **Streams** and **Equipment** views. Every piece of equipment shows how it was calculated.
-3. Change something in **Edit** (e.g. a process steam demand) and watch the plant re-balance.
-4. In **Streams**, pick a stream and click **Open in relief valve sizing**.
-5. Download the calculation report (HTML or Markdown) from the **Report** view or the relief page.
+1. **Draw**: drag equipment from the palette on the left onto the drawing (or click an item, then click the
+   drawing).
+2. **Connect**: hover over a unit to see its nozzles. Drag from an outlet (filled dot) to an inlet (open dot).
+   Drag an outlet into empty space for a stream leaving the system; drag an inlet into empty space to create a
+   water/steam supply.
+3. **Set up**: click a unit or line and fill in its settings on the right. Right-click a line to insert a pipe
+   segment, valve, heater or relief valve.
+4. **Read the results**: the drawing, the workbook (bottom) and each unit's **Results** and **Calculation** tabs
+   update after every change. Press **?** in the top bar for all shortcuts.
+5. **Save** the flowsheet (.json), **Export drawing** (.svg) and download a **Report**.
+
+Keyboard: `Del` delete · `R` rotate · `F` flip · `Ctrl+D` duplicate · `Ctrl+C`/`Ctrl+V` copy/paste ·
+`Ctrl+Z`/`Ctrl+Y` undo/redo · mouse wheel zoom · right/middle-drag pan · `0` fit to window.
+
+Your work is saved in the browser automatically, and restored when you come back.
 
 ## Screenshots
 
-| Steam system simulator | Equipment calculations |
+| Heat exchanger T–Q diagram | Relief valve on the P&ID, sized from its line |
 |---|---|
-| ![Simulator diagram](docs/images/simulator-diagram.png) | ![Equipment details](docs/images/simulator-equipment.png) |
-| **Relief valve sizing** | **Steam tables** |
+| ![Heat exchanger results](docs/images/designer-heat-exchanger.png) | ![Relief valve calculation](docs/images/designer-relief-valve.png) |
+
+![Industrial steam system](docs/images/designer-industrial.png)
+
+| Relief valve sizing | Steam tables |
+|---|---|
 | ![Relief valve sizing](docs/images/relief-sizing.png) | ![Steam tables](docs/images/steam-tables.png) |
+
+## Examples included
+
+- **Steam distribution with pipes and relief valves**: boiler house, 200 m insulated steam main, PRV station,
+  process heater, steam trap, flashing two-phase condensate return lifted 5 m, receiver and pump. Two relief
+  valves, and an Adjust that finds the boiler pressure needed for 10 bar(g) at the end of the main.
+- **Industrial steam system**: boiler, two headers, back-pressure turbine, PRV and desuperheater, flash steam
+  recovery, condensate return, deaerator.
+- **Rankine cycle with closed feedwater heater**.
+- **Simple and regenerative Rankine cycles**, which match textbook results.
 
 ## Using the library from Python
 
 ```python
-from steamsuite.relief import ReliefInput, size_relief_valve
+from steamsuite.examples import steam_distribution
 
-res = size_relief_valve(ReliefInput(
-    fluid="saturated_steam", flow_kg_h=10_000, set_pressure_kpag=1_000))
-print(res.orifice, round(res.required_area_mm2))   # L 1626
-open("psv.html", "w").write(res.report.to_html())  # full step-by-step report
+fs = steam_distribution()
+fs.solve()
+print(fs.blocks["L-101 Steam main"].results["dP"].value, "kPa")   # pipe pressure drop
+print(fs.blocks["PSV-101"].results["orifice"].value)               # API 526 orifice
+print(fs.report().to_markdown())                                   # full calculation report
 ```
 
 ```python
-from steamsuite.examples import industrial_steam_system
+from steamsuite.relief import ReliefInput, size_relief_valve
 
-fs = industrial_steam_system()
-fs.solve()
-print(fs.summary()["steam_generated"] * 3.6, "t/h")  # 9.42 t/h
-print(fs.report().to_markdown())
+res = size_relief_valve(ReliefInput(fluid="saturated_steam", flow_kg_h=10_000, set_pressure_kpag=1_000))
+print(res.orifice, round(res.required_area_mm2))   # L 1626
 ```
 
-Flowsheets save to and load from JSON (`Flowsheet.to_json()` and `Flowsheet.from_json()`), the same files
-the app's **Save** and **Open** buttons use.
-
-## Equipment available
-
-| Equipment | Calculates |
-|---|---|
-| Water / steam supply | Fixed flow, or "as required" by downstream equipment (e.g. make-up water) |
-| Pump | Outlet state from isentropic efficiency; shaft and electrical power; head |
-| Valve / pressure-reducing valve | Throttling at constant enthalpy; outlet superheat or flash fraction |
-| Steam turbine | Isentropic efficiency; shaft and electrical power; exhaust wetness warning |
-| Boiler | Saturated or superheated steam; heat duty; fuel input; blowdown |
-| Heater / cooler | Outlet temperature, dryness fraction or heat duty |
-| Condenser | Heat rejected; condensate subcooling; cooling water flow |
-| Mixer | Mass and energy balance |
-| Splitter | Outlets as fixed flow, %, "as required" or remainder |
-| Steam header | Mixes supplies at header pressure; a balancing supply makes up the shortfall |
-| Flash vessel | Flash steam and residual water at the vessel pressure |
-| Desuperheater | Spray water needed to reach a target temperature or superheat |
-| Deaerator / open feedwater heater | Heating steam (and make-up water) to produce saturated feedwater; vent |
-| Process steam user | Steam flow or heat duty; condensate return % and subcooling |
+The web app talks to the same library through a small JSON API (`/api/solve`, `/api/relief`,
+`/api/properties`, `/api/case-study`, ...). See `steamsuite/web/server.py`.
 
 ## Project layout
 
 ```
 steam-suite/
-├── app/                    Streamlit user interface
-│   ├── streamlit_app.py    entry point
-│   ├── ui.py               shared widgets (units, reports)
-│   └── views/              home, simulator, relief sizing, steam tables
-├── steamsuite/             calculation library (no UI dependencies)
-│   ├── water.py            IAPWS-IF97 properties
-│   ├── relief.py           relief valve sizing
-│   ├── report.py           step-by-step calculation reports
-│   ├── units.py            unit conversions
-│   ├── examples.py         example flowsheets
-│   └── flowsheet/          simulator: equipment models and solver
-├── tests/                  automated tests (pytest)
-└── docs/
-    ├── METHODS.md          equations and methods
-    └── VALIDATION.md       checks against published values
+├── steamsuite/
+│   ├── water.py          IAPWS-IF97 properties (CoolProp fast path, iapws fallback)
+│   ├── hydraulics.py     pipe friction, fittings, two-phase flow, heat loss, control valves
+│   ├── exchanger.py      zone analysis of two-stream heat exchangers
+│   ├── relief.py         relief valve sizing (API 520 / 526)
+│   ├── report.py         step-by-step calculation reports
+│   ├── examples.py       example flowsheets
+│   ├── flowsheet/        equipment models, solver, Adjust, case studies, auto-layout
+│   └── web/              FastAPI server and the browser app (plain JavaScript and SVG, no build step)
+├── tests/                pytest suite, plus tests/e2e/designer_e2e.mjs (browser test)
+└── docs/                 METHODS.md (equations), VALIDATION.md (checks), screenshots
 ```
 
 ## Tests
 
 ```bash
-cd steam-suite
-python -m pytest
+python -m pytest                                   # 106 tests: properties, hydraulics, equipment, solver, API
+python -m steamsuite.web --no-browser &            # then, with Playwright installed:
+node tests/e2e/designer_e2e.mjs                    # 32 browser checks: drawing, connecting, editing, undo, ...
 ```
 
-The tests check the property library against the IAPWS-IF97 verification tables, the simulator against
-textbook Rankine cycle examples, and the relief sizing against hand calculations with the API 520 equations.
-See [docs/VALIDATION.md](docs/VALIDATION.md).
+See [docs/VALIDATION.md](docs/VALIDATION.md) for what each check compares against.
 
-## Limitations (version 0.1)
+## Limitations
 
-- Steady state only. No dynamic simulation, start-up or control behaviour.
-- Pure water and steam only. No dissolved solids, glycols or non-condensable gases.
-- No pipe pressure-drop or heat-loss calculations yet. Pressure drops are entered per equipment.
-- Relief sizing takes the required relieving rate as an input. Scenario analysis (API 521), inlet
-  pressure-loss (3 %) checks, discharge piping and reaction forces are not yet included.
-- The superheat correction factor KSH is estimated from nozzle-flow theory unless a code value is entered.
+- Steady state only (no dynamics, start-up or control loops).
+- Water and steam only (no dissolved gases, glycols or other fluids).
+- Flows are set by specifications and "as required" demands, not by a pressure–flow network solve. Parallel
+  pipe branches don't share flow by hydraulics automatically; use Adjust to match pressures where needed.
+- Relief sizing needs the relieving rate as an input (no scenario analysis per API 521). Inlet pressure-loss
+  (3 %) checks, discharge piping and reaction forces are not included.
+- Two-phase pressure-drop correlations are typically accurate to about ±30 %.

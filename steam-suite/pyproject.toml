@@ -1,17 +1,28 @@
 [project]
 name = "steamsuite"
-version = "0.1.0"
-description = "Water and steam properties, steam system simulation and pressure relief valve sizing"
+version = "0.2.0"
+description = "P&ID designer and steady-state simulator for water and steam systems, with pipe hydraulics and relief valve sizing"
 requires-python = ">=3.10"
 dependencies = [
     "iapws>=1.5",
     "numpy>=1.24",
     "scipy>=1.10",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [project.optional-dependencies]
-app = ["streamlit>=1.36", "pandas>=2.0"]
-test = ["pytest>=7"]
+fast = ["CoolProp>=6.6"]
+test = ["pytest>=7", "httpx>=0.27"]
+
+[project.scripts]
+steamsuite = "steamsuite.web.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["steamsuite*"]
+
+[tool.setuptools.package-data]
+"steamsuite.web" = ["static/**/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

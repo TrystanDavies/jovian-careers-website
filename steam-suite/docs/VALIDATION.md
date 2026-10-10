@@ -1,7 +1,7 @@
 # Validation
 
-How Steam Suite's results were checked. All of these comparisons are automated tests in `tests/`, so they
-run every time `python -m pytest` is run (69 tests).
+How Steam Suite's results were checked. The comparisons in sections 1 to 6 are automated tests in `tests/`,
+run with `python -m pytest` (106 tests). Section 7 is a browser test of the P&ID designer.
 
 ## 1. Water and steam properties
 
@@ -10,9 +10,48 @@ run every time `python -m pytest` is run (69 tests).
 | Specific volume, enthalpy and entropy at 6 states in regions 1 and 2 | IAPWS R7-97 verification tables (Tables 5 and 15) | Match to 1 part in 10⁸ |
 | Saturation pressure at 300, 500 and 600 K | IAPWS R7-97 Table 35 | Match to 1 part in 10⁸ |
 | Enthalpy over a 5 × 4 grid (5 kPa to 20 MPa, 10 to 500 °C) | CoolProp's independent IF97 implementation | Match to 1 part in 10⁶ |
+| Fast path (CoolProp IF97 + Newton refinement) vs. the `iapws` package: more than 600 states from 300 random (P, h) points, 1 kPa to 16 MPa, as (P, h), (P, s) and (P, T) inputs | Same equations, independent code | Same phase; T to 10⁻⁶ K; h and s to 1 part in 10⁹; density to 10⁻⁷; viscosity, conductivity, speed of sound and c_p to 10⁻⁶ |
 | Out-of-range inputs (below 0 °C, below the triple point, above 100 MPa, dryness above the critical point) | — | Rejected with a readable message |
 
-## 2. Steam system simulator
+The fast-path comparison includes transport properties on purpose: it caught a bug where one property call
+overwrote another's results, which made a water pipe's pressure drop 11 % too low.
+
+## 2. Pipe hydraulics
+
+| Check | Basis | Result |
+|---|---|---|
+| Pipe bore, 2" Sch 40 | ASME B36.10M: OD 60.3 mm, wall 3.91 mm | 52.48 mm |
+| Friction factor: laminar, transition and turbulent | f = 64/Re; Colebrook–White | Exact |
+| Fully turbulent friction factor f_T | Crane TP-410: 0.019 for 2", 0.015 for 6" | 0.0189, 0.0149 |
+| Water, 3 kg/s at 20 °C, 100 m of 2" Sch 40 | Darcy–Weisbach by hand: v = 1.389 m/s, Re = 72,700, f = 0.02247 | 41.25 kPa, same as the hand calculation to 1 part in 10⁴ |
+| Static head, 10 m rise | ρgΔz | Exact to 0.1 % |
+| Saturated steam, 10 t/h at 10 bar(g), 100 m of 4" with K = 5 | The same pipe divided into 400 segments | 246.59 vs 246.59 kPa (difference 0.002 %) |
+| Two-phase flow (Müller-Steinhagen & Heck) at x → 0 and x → 1 | Must equal the all-liquid and all-vapour gradients | Within 0.1 % |
+| Heat loss, 4" pipe at 180 °C, 50 mm insulation (k = 0.04 W/m·K), h_o = 10 W/m²·K | Conduction plus surface resistance, by hand | 60.4 W/m, exact; the pipe model's loss agrees within 5 % as the steam cools along it, and condensate forms |
+| A 3" line asked to carry 10 t/h of 10 bar(g) steam over 200 m | Physically impossible (choked) | Reported as an error, not a wrong answer |
+| NPSH available | (P − P_v)/(ρg) | Exact |
+
+## 3. Control valves
+
+| Check | Basis | Result |
+|---|---|---|
+| Water, 5 kg/s at 40 °C, 10 → 6 bar(a) | IEC 60534 liquid equation by hand | Cv 10.45, exact |
+| Water and steam: size the Cv, then put that Cv back in and calculate the outlet pressure | Round trip | Outlet pressure recovered to 1 part in 10⁶ |
+| Superheated steam at 250 °C, 11 → 1.5 bar(a) | Choked: expansion factor Y must be 2/3 | Y = 0.6667, flagged as choked |
+| Asking a valve to pass more choked flow than its Cv allows | Physically impossible | Reported as an error |
+| On the P&ID: "Cv and opening" mode using the Cv the sizing mode found | Round trip through the whole flowsheet | Same outlet pressure to 1 part in 10⁶ |
+
+## 4. Heat exchangers
+
+| Check | Basis | Result |
+|---|---|---|
+| Water–water, 2 kg/s from 90 to 50 °C heating 3 kg/s from 20 °C | Duty from enthalpies; UA from the log-mean temperature difference | Duty exact; UA 9.2435 vs 9.2494 kW/K (0.06 %, because c_p varies with temperature, which the zone method includes) |
+| Rating: give the UA from the design case, find the outlet temperatures | Must reproduce the design | Hot outlet 50.0001 °C (target 50 °C) |
+| Condensing heater: steam at 3 bar(g) heating 5 kg/s of water from 40 to 120 °C | ṁ_steam = Q/h_fg | Exact to 1 part in 10⁸; condensate at saturation temperature to 10⁻⁶ K |
+| Cold outlet hotter than the hot inlet | Temperature cross | Reported as an error, with the largest duty the exchanger could transfer |
+| Energy balance across the exchanger | Hot side loses what cold side gains | Closes to 10⁻⁶ kW |
+
+## 5. Equipment, solver and tools
 
 ### Ideal simple Rankine cycle
 Çengel & Boles, *Thermodynamics: An Engineering Approach*, Example 10-1: 3 MPa and 350 °C at the turbine
@@ -42,42 +81,71 @@ flow is not entered: the simulator finds it from the heater's energy balance.
 The small differences come from the textbook's steam tables (based on IAPWS-95) versus IAPWS-IF97. They are
 within the stated uncertainty of IF97.
 
-### Industrial steam system (example flowsheet)
-There's no published answer for this one, so the checks are on internal consistency:
+### Example flowsheets
+There's no published answer for these, so the checks are on internal consistency:
 
-- Overall mass balance closes to 2 × 10⁻¹² kg/s, and energy balance to 3 × 10⁻⁹ kW.
-- Make-up water equals the sum of all losses (blowdown, unreturned condensate and deaerator vent).
-- The boiler produces exactly what the HP header sends to its users.
-- The deaerator outlet is saturated water at its pressure, and the desuperheater outlet is at the target
-  superheat of 10 °C.
-- Process heat duties are met exactly.
+- **Industrial steam system:** mass balance closes to 2 × 10⁻¹² kg/s and energy to 3 × 10⁻⁹ kW. Make-up
+  water equals the sum of all losses. The boiler produces exactly what the HP header sends to its users. The
+  deaerator outlet is saturated water, the desuperheater outlet is at its 10 °C superheat target, and process
+  duties are met exactly.
+- **Steam distribution:** mass balance closes exactly and energy to 3 × 10⁻¹⁰ kW, including pipe heat losses
+  and pump work. The pipe pressure drop is the sum of its friction, fittings, static and acceleration parts to
+  1 part in 10⁹.
 
-Each equipment type also has its own test: valve flash fraction, flash vessel mass and energy split, turbine
-power from isentropic efficiency, steam user flow from heat duty, splitter fractions and remainders, mixer
-energy balance, and heater duty.
+### Other equipment and tools
 
-## 3. Relief valve sizing
+| Check | Result |
+|---|---|
+| Valve flash fraction, flash vessel split, turbine power from isentropic efficiency, steam user flow from heat duty, splitter fractions and shortages, mixer and heater energy balances | Each matches its hand calculation |
+| Pump curve: operating point lies on H = H₀ − (H₀ − H_r)(Q/Q_r)²; NPSH warning when NPSHa < NPSHr | Exact; warning given |
+| Steam compressor at 100 % efficiency | Isentropic (entropy unchanged to 10⁻⁶) |
+| Relief valve placed on a P&ID line vs the stand-alone relief sizing for the same conditions | Same area to 1 part in 10⁶ and the same orifice |
+| Adjust with limits (Brent's method): supply pressure that gives 9 bar(g) at the end of a steam main | Target met to 1 part in 10⁷ |
+| Adjust without limits (secant method): pump outlet pressure for a given power | Target met to 1 part in 10⁵ |
+| Adjust with a target outside its limits | Reported as "No solution between the limits" |
+| Case study of pipe pressure drop against flow | Increases with flow; original setting restored afterwards |
+| Save and reload (JSON), including the drawing layout | Identical results and layout |
+| Missing connections, duplicate stream names, failing equipment | Clear messages instead of crashes |
+
+## 6. Relief valve sizing
 
 | Check | Basis | Result |
 |---|---|---|
 | Saturated steam, 153,500 lb/h, set 1600 psig, 10 % overpressure | Hand calculation with the API 520 steam equation in US units: P₁ = 1774.7 psia, KN = 1.0115, A = 1.703 in² | 1.703 in², K orifice |
 | SI and US forms of the steam equation | 190.4 (SI) is the exact unit conversion of 51.5 (US) | Agree to 0.2 % |
-| Napier's equation vs. direct integration (isentropic nozzle flow, IF97) for saturated steam, 1 to 150 bar(g) | Theory | Within ±3.2 % (Napier is empirical) |
+| Napier's equation vs. direct integration (isentropic nozzle flow, IF97) for saturated steam, 1 to 150 bar(g) | Theory | Within ±4 % (Napier is empirical, and KN steps at 1500 psia) |
 | Liquid equation vs. Bernoulli's equation with Kd = 0.65 | A = W / (Kd·√(2ρΔP)) | Agree to 0.01 % (182.90 vs 182.89 mm²) |
 | Choked steam critical pressure ratio | Expected about 0.58 for saturated steam | 0.55–0.60 |
 | Superheat factor KSH | Should fall below 1 and decrease with superheat | 1 > KSH(250 °C) > KSH(400 °C) > 0.7 |
 | Hot water that flashes | Must need more area than cold water at the same conditions | Yes; switches to direct integration with a two-phase warning |
+| Wet steam | Mass flux must exceed dry steam's | Yes |
 | Rupture disk upstream | Area ÷ 0.9 | Exact |
-| Low set pressure | ASME minimum overpressure of 3 psi (20.7 kPa) applied | Exact |
+| Low set pressure, fire case | ASME minimum overpressure of 3 psi (20.7 kPa); 21 % for fire | Exact |
 | Orifice selection | API 526 letters D to T; boundaries; multiple T valves | Exact |
 | Invalid inputs | e.g. "superheated" steam below saturation, back pressure above set pressure | Rejected with a clear message |
 
 Every equation in every report (279 in the test set) was also rendered with KaTeX in strict mode to make sure
 the step-by-step reports display correctly.
 
+## 7. Web API and browser
+
+- **API tests** (`tests/test_web_api.py`): every equipment type is in the catalogue; every example loads with a
+  layout and solves; structural errors, calculation steps, charts, Adjust results, relief sizing, properties,
+  case study and report downloads all return what the browser expects.
+- **Browser test** (`tests/e2e/designer_e2e.mjs`, Playwright with Chromium): 32 checks on the real app:
+  loading and solving examples; dragging equipment from the palette and placing it by clicking; connecting
+  nozzles; making a product stream by dragging an outlet into empty space; pipe results and rendered
+  equations; inserting a valve into a line; adding and sizing a relief valve; undo and redo; rotate,
+  duplicate and delete; tidy layout; the workbook, units switching and case study; saving a flowsheet and
+  exporting the drawing as SVG; the relief sizing and steam table pages. It also fails if the browser logs any
+  JavaScript error.
+
 ## What has not been validated
 
 - Comparison against a commercial simulator (e.g. Aspen HYSYS or Aspen Plus) or plant data.
+- Two-phase pressure drop against measurements. The correlations used are typically within ±30 %.
 - Relief sizing against the manufacturer's certified capacities for a specific valve model.
 - KSH against the tabulated values in ASME Section I or API 520. Enter the tabulated value when your design
   code requires it.
+- Control valve sizing against a manufacturer's sizing program (the valve-specific F_L, x_T and Cv must come
+  from the manufacturer).

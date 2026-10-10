@@ -18,7 +18,27 @@ from .flowsheet.blocks import (
     Turbine,
     Valve,
 )
+from .flowsheet.advanced import Adjust, HeatExchanger, Pipe, ReliefValveUnit
 from .units import P_ATM_KPA
+
+
+def _place(fs: Flowsheet, positions: dict, ends: dict | None = None, labels: dict | None = None,
+           mids: dict | None = None) -> Flowsheet:
+    """Drawing positions: name -> (x, y[, rotation, flip]); ends: product stream -> (x, y);
+    labels: stream -> (dx, dy) label offset; mids: stream -> (axis, value) middle segment position."""
+    nodes = {}
+    for name, p in positions.items():
+        x, y, *rest = p
+        nodes[name] = {"x": x, "y": y, "rot": rest[0] if rest else 0, "flip": rest[1] if len(rest) > 1 else False}
+    streams: dict = {}
+    for k, v in (ends or {}).items():
+        streams.setdefault(k, {})["end"] = {"x": v[0], "y": v[1]}
+    for k, v in (labels or {}).items():
+        streams.setdefault(k, {})["label"] = {"dx": v[0], "dy": v[1]}
+    for k, v in (mids or {}).items():
+        streams.setdefault(k, {})["mid"] = {"axis": v[0], "v": v[1]}
+    fs.layout = {"nodes": nodes, "streams": streams}
+    return fs
 
 
 def barg(v: float) -> float:
@@ -85,7 +105,15 @@ def industrial_steam_system() -> Flowsheet:
                      params={"spec": "Heat duty", "duty": 3000.0, "return_percent": 70.0, "subcooling": 50.0}))
     fs.add(Mixer("Condensate return", inlets={"in": ["Flash condensate", "Process B condensate"]},
                  outlets={"out": "Condensate return"}))
-    return fs
+    return _place(fs, {
+        "Boiler": (140, 170), "HP header (10 bar g)": (560, 90), "Process A": (420, 260),
+        "Back-pressure turbine": (620, 270), "PRV": (800, 259), "Desuperheater": (960, 264),
+        "Flash vessel": (380, 450), "LP header (3 bar g)": (780, 420), "Process B": (860, 570),
+        "Condensate return": (580, 680, 0, True), "Deaerator": (280, 720, 0, True), "Make-up water": (90, 560),
+        "Feed pump": (440, 880), "Feedwater split": (600, 862),
+    }, ends={"Blowdown": (140, 270), "Process A losses": (520, 350), "Process B losses": (960, 670),
+             "DA vent": (340, 630)},
+       mids={"Boiler feed": ("y", 960), "Spray water": ("x", 1080)})
 
 
 def simple_rankine() -> Flowsheet:
@@ -139,12 +167,98 @@ def regenerative_rankine() -> Flowsheet:
     return fs
 
 
+def steam_distribution() -> Flowsheet:
+    fs = Flowsheet(
+        "Steam distribution with pipes and relief valves",
+        "Steam from the boiler house travels 200 m along an insulated 4\" main to a pressure-reducing station, then "
+        "60 m to a process heater that warms 8 kg/s of water from 40 to 90 °C. Condensate passes a steam trap, is "
+        "lifted 5 m up a 3\" return line as a flashing two-phase flow, and is pumped from a vented receiver. "
+        "An Adjust finds the boiler pressure that delivers 10 bar(g) at the end of the main; two relief valves are "
+        "sized from the line conditions.",
+    )
+    fs.add(Feed("Boiler house", outlets={"out": "S1"},
+                params={"pressure": barg(10.5), "condition": "Dryness fraction", "dryness": 1.0,
+                        "flow_mode": "As required", "flow": 1.0}))
+    fs.add(Pipe("L-101 Steam main", inlets={"in": "S1"}, outlets={"out": "S2"},
+                params={"nps": "4", "schedule": "40", "length": 200.0,
+                        "fittings": {"elbow_90_lr": 8, "gate": 2, "tee_run": 3},
+                        "heat_loss": "Insulated", "ins_thickness": 50.0}))
+    fs.add(Valve("PCV-101", inlets={"in": "S2"}, outlets={"out": "S3"},
+                 params={"outlet_pressure": barg(4.0), "cv": 63.0, "characteristic": "Equal percentage"}))
+    fs.add(Pipe("L-102 LP steam", inlets={"in": "S3"}, outlets={"out": "S4"},
+                params={"nps": "4", "schedule": "40", "length": 60.0, "fittings": {"elbow_90_lr": 4, "gate": 1},
+                        "heat_loss": "Insulated", "ins_thickness": 40.0}))
+    fs.add(Feed("Process water", outlets={"out": "W1"},
+                params={"pressure": barg(3.0), "temperature": 40.0, "flow": 8.0}))
+    fs.add(HeatExchanger("E-101 Process heater", inlets={"hot_in": "S4", "cold_in": "W1"},
+                         outlets={"hot_out": "S5", "cold_out": "W2"},
+                         params={"spec": "Condensing heater (hot flow as required)", "cold_T": 90.0, "hot_x": 0.0,
+                                 "dp_cold": 30.0}))
+    fs.add(Valve("ST-101 Steam trap", inlets={"in": "S5"}, outlets={"out": "S6"},
+                 params={"outlet_pressure": barg(1.0)}))
+    fs.add(Pipe("L-103 Condensate return", inlets={"in": "S6"}, outlets={"out": "S7"},
+                params={"nps": "3", "schedule": "40", "length": 100.0, "elevation": 5.0,
+                        "fittings": {"elbow_90_std": 6, "check_swing": 1}}))
+    fs.add(FlashVessel("V-101 Condensate receiver", inlets={"in": "S7"},
+                       outlets={"vapour": "Flash steam to vent", "liquid": "C1"},
+                       params={"pressure": barg(0.05)}))
+    fs.add(Pump("P-101 Condensate pump", inlets={"in": "C1"}, outlets={"out": "C2"},
+                params={"outlet_pressure": barg(3.0), "efficiency": 60.0, "npshr": 2.0, "suction_head": 3.0}))
+    fs.add(ReliefValveUnit("PSV-101", params={"stream": "S3", "tag": "PSV-101", "set_pressure": barg(6.0),
+                                              "rate_mode": "Stream flow × factor", "rate_factor": 1.0}))
+    fs.add(ReliefValveUnit("PSV-102", params={"stream": "W2", "tag": "PSV-102", "set_pressure": barg(5.0),
+                                              "rate_mode": "Fixed rate", "rate": 0.5}))
+    fs.add(Adjust("ADJ-101", params={"var_block": "Boiler house", "var_param": "pressure",
+                                     "target_type": "Stream property", "target_stream": "S2",
+                                     "target_property": "Pressure", "target_value": barg(10.0),
+                                     "lower": barg(10.0), "upper": barg(14.0)}))
+    return _place(fs, {
+        "ADJ-101": (130, 50), "Boiler house": (100, 160), "L-101 Steam main": (290, 160), "PCV-101": (470, 149),
+        "PSV-101": (560, 60), "L-102 LP steam": (660, 160), "E-101 Process heater": (880, 230),
+        "Process water": (700, 230), "PSV-102": (1010, 130), "ST-101 Steam trap": (820, 340, 0, True),
+        "L-103 Condensate return": (620, 351, 0, True), "V-101 Condensate receiver": (430, 358, 0, True),
+        "P-101 Condensate pump": (300, 470, 0, True),
+    }, ends={"W2": (1080, 230), "Flash steam to vent": (430, 250), "C2": (150, 452)})
+
+
+def rankine_closed_fwh() -> Flowsheet:
+    fs = Flowsheet(
+        "Rankine cycle with closed feedwater heater",
+        "Turbine inlet 15 MPa and 600 °C, condenser at 10 kPa(a). Steam extracted at 1.2 MPa heats the feedwater in "
+        "a closed (shell-and-tube) heater to 3 °C below the extraction saturation temperature; the drains are "
+        "throttled back to the condenser. The extraction flow is found automatically.",
+    )
+    fs.add(Feed("Condensate (cycle start)", outlets={"out": "1"},
+                params={"pressure": kpa(10), "condition": "Dryness fraction", "dryness": 0.0, "flow": 10.0}))
+    fs.add(Pump("P-1 Feed pump", inlets={"in": "1"}, outlets={"out": "2"},
+                params={"outlet_pressure": kpa(15000), "efficiency": 85.0, "motor_efficiency": 100.0}))
+    fs.add(HeatExchanger("E-1 Feedwater heater", inlets={"hot_in": "6", "cold_in": "2"},
+                         outlets={"hot_out": "7", "cold_out": "3"},
+                         params={"spec": "Condensing heater (hot flow as required)", "cold_T": 184.97, "hot_x": 0.0}))
+    fs.add(Boiler("B-1 Boiler", inlets={"in": "3"}, outlets={"steam": "4"},
+                  params={"pressure": kpa(15000), "steam_condition": "Superheated", "temperature": 600.0,
+                          "efficiency": 100.0}))
+    fs.add(Turbine("T-1 HP turbine", inlets={"in": "4"}, outlets={"out": "5"},
+                   params={"outlet_pressure": kpa(1200), "efficiency": 87.0, "generator_efficiency": 100.0}))
+    fs.add(Splitter("Extraction", inlets={"in": "5"}, outlets={"out": ["6", "8"]},
+                    params={"outlet_specs": {"6": {"mode": "As required", "value": 0.0},
+                                             "8": {"mode": "Remainder", "value": 0.0}}}))
+    fs.add(Turbine("T-2 LP turbine", inlets={"in": "8"}, outlets={"out": "9"},
+                   params={"outlet_pressure": kpa(10), "efficiency": 87.0, "generator_efficiency": 100.0}))
+    fs.add(Valve("Drain valve", inlets={"in": "7"}, outlets={"out": "10"}, params={"outlet_pressure": kpa(10)}))
+    fs.add(Mixer("Hotwell", inlets={"in": ["9", "10"]}, outlets={"out": "11"}))
+    fs.add(Condenser("C-1 Condenser", inlets={"in": "11"}, outlets={"out": "12"}))
+    return fs
+
+
 def empty() -> Flowsheet:
     return Flowsheet("New flowsheet", "")
 
 
 EXAMPLES = {
+    "Steam distribution with pipes and relief valves": steam_distribution,
     "Industrial steam system": industrial_steam_system,
+    "Rankine cycle with closed feedwater heater": rankine_closed_fwh,
     "Simple Rankine cycle (textbook)": simple_rankine,
     "Regenerative Rankine cycle (textbook)": regenerative_rankine,
     "Empty flowsheet": empty,

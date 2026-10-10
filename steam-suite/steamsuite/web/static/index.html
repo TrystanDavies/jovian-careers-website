@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Steam Suite</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>♨</text></svg>">
+<link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+<link rel="stylesheet" href="/static/css/app.css">
+<script defer src="/static/vendor/katex/katex.min.js"></script>
+<script type="module" src="/static/js/main.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><span class="brand-icon">♨</span> Steam Suite</div>
+  <nav class="tabs" id="page-tabs">
+    <a href="#/designer" data-page="designer">P&amp;ID designer</a>
+    <a href="#/relief" data-page="relief">Relief valve sizing</a>
+    <a href="#/steam" data-page="steam">Steam tables</a>
+  </nav>
+  <div class="spacer"></div>
+  <label class="units-select">Units
+    <select id="units-preset" aria-label="Units"></select>
+  </label>
+  <button class="btn ghost" id="help-btn" title="Help and keyboard shortcuts">?</button>
+</header>
+
+<main>
+  <!-- P&ID designer -->
+  <section class="page" id="page-designer">
+    <div class="toolbar" id="toolbar"></div>
+    <div class="designer">
+      <aside class="palette" id="palette" aria-label="Equipment palette"></aside>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <svg id="pid" tabindex="0" aria-label="P&amp;ID drawing"></svg>
+        <div class="canvas-hint" id="canvas-hint"></div>
+        <div class="statusbar" id="statusbar"></div>
+      </div>
+      <aside class="inspector" id="inspector" aria-label="Properties"></aside>
+    </div>
+    <div class="workbook" id="workbook">
+      <div class="workbook-resize" id="workbook-resize" title="Drag to resize"></div>
+      <div class="workbook-head" id="workbook-head"></div>
+      <div class="workbook-body" id="workbook-body"></div>
+    </div>
+  </section>
+
+  <!-- Relief valve sizing -->
+  <section class="page" id="page-relief" hidden></section>
+
+  <!-- Steam tables -->
+  <section class="page" id="page-steam" hidden></section>
+</main>
+
+<div id="ctxmenu" class="ctxmenu" hidden></div>
+<div id="modal-root"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

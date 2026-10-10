@@ -118,6 +118,9 @@ class Pump(Block):
         Param("motor_efficiency", "Motor efficiency", "percent", 95.0, min_value=1.0, max_value=100.0),
         Param("npshr", "NPSH required (0 = don't check)", "head", 0.0, min_value=0.0, group="Suction",
               help="From the pump data sheet. Compared with the NPSH available at the suction."),
+        Param("suction_head", "Static head of liquid above the pump suction", "head", 0.0, group="Suction",
+              help="Height of the liquid level in the suction vessel above the pump inlet, less suction line "
+                   "losses. Added to the NPSH available."),
     ]
 
     def _outlet_pressure(self, sin, st1):
@@ -163,6 +166,7 @@ class Pump(Block):
         self.result("dT", "Temperature rise", st2.T - st1.T, "temperature_diff")
         npsha = npsh_available(st1)
         if npsha is not None:
+            npsha += self.p("suction_head")
             self.result("npsha", "NPSH available", npsha, "head")
             npshr = self.p("npshr")
             if npshr > 0 and npsha < npshr + 0.5:
@@ -194,8 +198,9 @@ class Pump(Block):
                   result=rf"W = {num(W, 5)}{unit('kW')}, \quad W_{{elec}} = {num(W / eta_m, 5)}{unit('kW')}")
         if npsha is not None:
             self.step("Net positive suction head available",
-                      text="Suction pressure above the vapour pressure, expressed as a head of water (velocity head neglected).",
-                      equation=r"NPSH_a = \frac{P_1 - P_v(T_1)}{\rho_1 g}",
+                      text=("Suction pressure above the vapour pressure, expressed as a head of water, plus the static "
+                            "head of liquid above the suction (velocity head neglected)."),
+                      equation=r"NPSH_a = \frac{P_1 - P_v(T_1)}{\rho_1 g} + z_s",
                       result=rf"NPSH_a = {num(npsha, 4)}{unit('m')}")
 
     def update_demands(self):

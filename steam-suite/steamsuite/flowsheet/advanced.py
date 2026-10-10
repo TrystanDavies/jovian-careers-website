@@ -163,7 +163,7 @@ class Pipe(Block):
                       "provide drain points with steam traps.")
         elif st1.is_liquid_like and st2.phase == "two-phase":
             self.warn("The water flashes to steam in this pipe as the pressure falls.")
-        wet = [st for st in (st1, st2) if st.phase == "two-phase" and 0.01 < st.x < 0.99]
+        wet = [st for st in (st1, st2) if st.phase == "two-phase" and 0.02 < st.x < 0.98]
         if wet:
             self.warn("Two-phase flow: pressure drop correlations are typically accurate to ±30 %.")
 
