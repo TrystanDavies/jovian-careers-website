@@ -1,0 +1,18 @@
+[project]
+name = "steamsuite"
+version = "0.1.0"
+description = "Water and steam properties, steam system simulation and pressure relief valve sizing"
+requires-python = ">=3.10"
+dependencies = [
+    "iapws>=1.5",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.36", "pandas>=2.0"]
+test = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
