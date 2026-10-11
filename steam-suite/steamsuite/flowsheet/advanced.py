@@ -25,6 +25,7 @@ from ..relief import FLUIDS, OVERPRESSURE_BASES, VALVE_TYPES, ReliefInput, _over
 from ..report import num, tex_text, unit
 from ..units import P_ATM_KPA, fmt
 from ..water import P_CRIT_KPA, T_sat, WaterPropertyError, state_Ph, state_PT, state_Px
+from .blocks import _dp_equations, _outlet_after_dp, dp_params, flow_dp
 from .core import STREAM_PROPERTIES, Block, Param, Port, register
 
 G_ACC = 9.80665
@@ -139,7 +140,7 @@ class Pipe(Block):
             return f'{self.p("nps")}" Sch {self.p("schedule")}, {fmt(self.p("length"), 3)} m'
         return f'ID {fmt(self.p("diameter"), 3)} mm, {fmt(self.p("length"), 3)} m'
 
-    def _run(self, m, P, h, segments=None):
+    def _run(self, m, P, h, segments=None, strict=True):
         d, od = self.dims()
         eps = self.roughness()
         k_fit, rows = fittings_k(self.p("fittings"), d)
@@ -149,14 +150,14 @@ class Pipe(Block):
             heat = HeatLoss(t_ambient=self.p("ambient"),
                             insulation_mm=self.p("ins_thickness") if self.p("heat_loss") == "Insulated" else 0.0,
                             k_insulation=self.p("ins_k"), h_outside=self.p("h_out"), od_mm=od)
-        key = (round(m, 12), round(P, 9), round(h, 9), segments,
+        key = (round(m, 12), round(P, 9), round(h, 9), segments, strict,
                repr(sorted(self.params.items(), key=lambda kv: kv[0])))
         res = self._memo.get(key)
         if res is None:
             try:
                 res = pipe_flow(m, P, h, d, float(self.p("length")), eps, float(self.p("elevation")), k_total, heat,
                                 self.p("method"), segments=segments, void_model=self.p("void_model"),
-                                tp_factor=float(self.p("tp_factor")))
+                                tp_factor=float(self.p("tp_factor")), strict=strict)
             except (ValueError, WaterPropertyError) as exc:  # remember failures too: solvers retry the same inputs
                 res = exc
             if len(self._memo) > 64:
@@ -166,11 +167,62 @@ class Pipe(Block):
             raise res.with_traceback(None)
         return res, d, od, eps, k_total, rows
 
+    def _pf_segments(self) -> int:
+        return int(self.pf_state.get("segments", 20))
+
+    def hydraulics(self, net):
+        sin, out = self.s_in("in"), self.s_out("out")
+        net.same_flow(sin, out, "same flow in and out")
+        # a fixed number of segments keeps the pressure drop a smooth function of the flow
+        segs = 20
+        if sin.known:
+            try:
+                r = self._run(sin.m, sin.P, sin.h)[0]
+                segs = 60 if r.dp_total > 0.25 * sin.P else 20
+                dp_scale = max(abs(r.dp_total), 1e-3 * sin.P, 1e-3)
+            except (ValueError, WaterPropertyError):
+                dp_scale = net.P_ref
+        else:
+            dp_scale = net.P_ref
+        self.pf_state["segments"] = segs
+        h_in = sin.h
+
+        length = float(self.p("length"))
+
+        def outlet(m, P1, h_in=h_in, segs=segs):
+            r = self._run(m, P1, h_in, segments=segs, strict=False)[0]
+            if r.choked and r.L_choke:
+                # beyond choking there is no solution; continue the curve downwards smoothly so that the
+                # solver is steered back to flows the pipe can pass (a choked answer is reported later)
+                return r.P_out - (P1 - r.P_out) * (length - r.L_choke) / r.L_choke
+            return r.P_out
+
+        d = self.dims()[0] / 1000.0
+        st = sin.state if sin.known else None
+        v_nom = 2.0 if st is None or st.is_liquid_like else (10.0 if st.phase == "two-phase" else 25.0)
+        m_nom = (st.rho if st is not None else 1000.0) * v_nom * math.pi * d * d / 4.0
+        net.element(sin, out, outlet, f"pipe pressure drop ({self.describe_size()})", scale=dp_scale,
+                    m_nominal=m_nom)
+
+    def diagnose(self, net, x) -> str | None:
+        sin = self.s_in("in")
+        m, P1 = x[net.im(sin)], x[net.ip(sin)]
+        try:
+            r = self._run(m, P1, sin.h, segments=self._pf_segments(), strict=False)[0]
+        except (ValueError, WaterPropertyError):
+            return None
+        if r.choked:
+            return (f"the flow is choked: {fmt(m * 3600, 4)} kg/h reaches the speed of sound {fmt(r.L_choke, 3)} m "
+                    f"along this {fmt(self.p('length'), 3)} m pipe, so it cannot pass the flow needed downstream. "
+                    "Increase the pipe size.")
+        return None
+
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
         st1 = sin.state
         try:
-            res, d, od, eps, k_total, rows = self._run(sin.m, sin.P, sin.h)
+            res, d, od, eps, k_total, rows = self._run(sin.m, sin.P, sin.h,
+                                                        segments=self._pf_segments() if self.pf else None)
         except PipeChokedError as exc:
             r = exc.result
             raise ValueError(
@@ -388,6 +440,8 @@ class HeatExchanger(Block):
         Param("arrangement", "Flow arrangement", "choice", "Counter-current", choices=("Counter-current", "Co-current")),
         Param("dp_hot", "Hot side pressure drop", "pressure_diff", 0.0, min_value=0.0, group="Pressure drops"),
         Param("dp_cold", "Cold side pressure drop", "pressure_diff", 0.0, min_value=0.0, group="Pressure drops"),
+        *dp_params("hot_", "Hot side pressure drop", "Pressure drops"),
+        *dp_params("cold_", "Cold side pressure drop", "Pressure drops"),
     ]
 
     N_ZONES = 20
@@ -398,8 +452,8 @@ class HeatExchanger(Block):
 
     def _sides(self):
         hi, ci = self.s_in("hot_in"), self.s_in("cold_in")
-        hot = hx.Side(hi.m, hi.P, hi.h, hi.P - self.p("dp_hot"))
-        cold = hx.Side(ci.m, ci.P, ci.h, ci.P - self.p("dp_cold"))
+        hot = hx.Side(hi.m, hi.P, hi.h, _outlet_after_dp(self, hi, self.s_out("hot_out"), "hot_", "dp_hot"))
+        cold = hx.Side(ci.m, ci.P, ci.h, _outlet_after_dp(self, ci, self.s_out("cold_out"), "cold_", "dp_cold"))
         if hot.P_out <= 0 or cold.P_out <= 0:
             raise ValueError("A pressure drop is larger than the inlet pressure.")
         return hot, cold
@@ -534,6 +588,20 @@ class HeatExchanger(Block):
             return s.P - dp, s.h, s.m
         return None
 
+    def hydraulics(self, net):
+        hi, ho, ci, co = self.s_in("hot_in"), self.s_out("hot_out"), self.s_in("cold_in"), self.s_out("cold_out")
+        _dp_equations(self, net, hi, ho, "hot_", "dp_hot", "hot side: ")
+        _dp_equations(self, net, ci, co, "cold_", "dp_cold", "cold side: ")
+        if self.p("spec") == "Condensing heater (hot flow as required)":
+            P_ho = ho.P if ho.known else hi.P - self.p("dp_hot")
+            P_co = co.P if co.known else ci.P - self.p("dp_cold")
+            dh_hot = hi.h - state_Px(P_ho, self.p("hot_x")).h
+            dh_cold = state_PT(P_co, self.p("cold_T")).h - ci.h
+            if dh_hot <= 0:
+                raise ValueError("The hot (heating) side cannot give up heat to reach its outlet condition.")
+            net.linear_flows({hi: dh_hot, ci: -dh_cold}, 0.0, "energy balance: heating flow for the cold outlet "
+                                                              "temperature")
+
 
 # --- relief valve on the drawing -----------------------------------------------------------------
 
@@ -569,6 +637,9 @@ class ReliefValveUnit(Block):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.relief = None
+
+    def hydraulics(self, net):
+        """Closed in normal operation: no flow equations."""
 
     def calculate(self):
         if not self._ctx.final:
@@ -661,9 +732,61 @@ class Adjust(Block):
     def calculate(self):
         """The search is done by the flowsheet solver; nothing to do in a pass."""
 
+    def hydraulics(self, net):
+        """Works on whole solutions, not on the network equations."""
+
     def target_kind(self, blocks) -> str:
         if self.p("target_type") == "Stream property":
             return STREAM_PROPERTIES.get(self.p("target_property"), ("number",))[0]
         b = blocks.get(self.p("target_block"))
         r = b.results.get(self.p("target_result")) if b else None
         return r.kind if r else "number"
+
+
+# --- specification (pressure–flow mode) ----------------------------------------------------------
+
+
+@register
+class Specification(Block):
+    TYPE = "specification"
+    LABEL = "Flow / pressure specification"
+    CATEGORY = "Logical"
+    DESCRIPTION = ("Fixes the flow or the pressure of any stream in pressure–flow mode, like a flow or pressure "
+                   "controller holding its set point. The equipment's other settings must leave that value free.")
+    INLETS = []
+    OUTLETS = []
+    PARAMS = [
+        Param("stream", "Stream", "stream_choice", ""),
+        Param("property", "Fix its", "choice", "Mass flow", choices=("Mass flow", "Pressure")),
+        Param("flow", "Flow", "mass_flow", 1.0, show_if=("property", ("Mass flow",))),
+        Param("pressure", "Pressure", "pressure", 301.325, show_if=("property", ("Pressure",))),
+    ]
+
+    def _stream(self):
+        name = self.p("stream")
+        if not name:
+            raise ValueError("Choose the stream to specify.")
+        s = self._ctx.streams.get(name)
+        if s is None:
+            raise ValueError(f"Stream '{name}' does not exist.")
+        return s
+
+    def hydraulics(self, net):
+        s = self._stream()
+        if self.p("property") == "Mass flow":
+            net.flow(s, self.p("flow"), f"specified flow of '{s.name}'")
+        else:
+            net.pressure(s, self.p("pressure"), f"specified pressure of '{s.name}'")
+
+    def calculate(self):
+        s = self._stream()
+        if not s.known:
+            return
+        flow = self.p("property") == "Mass flow"
+        target = self.p("flow") if flow else self.p("pressure")
+        actual = s.m if flow else s.P
+        kind = "mass_flow" if flow else "pressure"
+        self.result("target", "Specified value", target, kind)
+        self.result("actual", "Value in the solution", actual, kind)
+        if not self.pf:
+            self.warn("Specifications act only in pressure–flow mode (switch the solver in the toolbar).")

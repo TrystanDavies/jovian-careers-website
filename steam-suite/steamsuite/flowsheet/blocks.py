@@ -18,7 +18,7 @@ from ..water import (
     state_Ps,
     state_Px,
 )
-from ..hydraulics import characteristic, npsh_available, valve_cv_required, valve_outlet_pressure
+from ..hydraulics import characteristic, npsh_available, valve_cv_required, valve_flow, valve_outlet_pressure
 from .core import Block, Param, Port, allocate_outlets, register, requested_outflow
 
 TOL_P = 1e-6  # kPa
@@ -32,6 +32,34 @@ def _sat_h(P: float) -> tuple[float, float]:
 
 def _kj(v: float) -> str:
     return f"{num(v, 5)}{unit('kJ/kg')}"
+
+
+DP_MODES = ("Fixed", "Scales with flow²")
+
+
+def flow_dp(m: float, rho: float, dp_rated: float, m_rated: float, rho_rated: float = 0.0) -> float:
+    """Pressure drop that grows with the square of the flow: ΔP = ΔP_r·(m|m|/m_r²)·(ρ_r/ρ).
+
+    The density correction applies only when a rated density is given (vapour or wet steam)."""
+    if m_rated <= 0:
+        raise ValueError("Enter the rated flow at which the pressure drop applies.")
+    ratio = (rho_rated / rho) if rho_rated > 0 and rho > 0 else 1.0
+    return dp_rated * m * abs(m) / (m_rated * m_rated) * ratio
+
+
+def dp_params(prefix: str = "", label: str = "Pressure drop", group: str = "") -> list[Param]:
+    """Settings for a pressure drop that is either fixed or scales with flow²."""
+    key = f"{prefix}dp_mode"
+    return [
+        Param(key, f"{label} model", "choice", "Fixed", choices=DP_MODES, group=group,
+              help="'Scales with flow²' makes the pressure drop respond to the flow, so parallel branches share "
+                   "flow realistically in pressure–flow mode."),
+        Param(f"{prefix}rated_flow", f"Flow at which the {label.lower()} is given", "mass_flow", 1.0, min_value=1e-9,
+              show_if=(key, ("Scales with flow²",)), group=group),
+        Param(f"{prefix}rated_density", "Inlet density at that flow (0 = no density correction)", "density", 0.0,
+              min_value=0.0, show_if=(key, ("Scales with flow²",)), group=group,
+              help="For steam, the pressure drop also scales with specific volume. Leave 0 for water."),
+    ]
 
 
 # --- sources --------------------------------------------------------------------
@@ -52,8 +80,11 @@ class Feed(Block):
         Param("temperature", "Temperature", "temperature", 20.0, show_if=("condition", ("Temperature",))),
         Param("dryness", "Dryness fraction", "fraction", 1.0, help="0 = saturated water, 1 = dry saturated steam",
               show_if=("condition", ("Dryness fraction",)), min_value=0.0, max_value=1.0),
-        Param("flow_mode", "Flow", "choice", "Fixed", choices=("Fixed", "As required"),
-              help="'As required' supplies whatever the connected equipment asks for (e.g. make-up water)."),
+        Param("flow_mode", "Flow", "choice", "Fixed",
+              choices=("Fixed", "As required", "Pressure reference (expansion tank)"),
+              help="'As required' supplies whatever the connected equipment asks for (e.g. make-up water). In "
+                   "pressure–flow mode it supplies whatever flow the pressures drive. A pressure reference (an "
+                   "expansion tank) only sets the pressure of a closed loop; its flow settles at zero."),
         Param("flow", "Flow rate (fixed, or a starting estimate)", "mass_flow", 1.0, min_value=0.0),
     ]
 
@@ -65,20 +96,25 @@ class Feed(Block):
     def calculate(self):
         st = self._state()
         out = self.s_out("out")
-        if self.p("flow_mode") == "Fixed":
+        mode = self.p("flow_mode")
+        if mode == "Fixed":
             m = self.p("flow")
+        elif mode.startswith("Pressure reference"):
+            m = out.demand if out.demand is not None else 0.0
         else:
             m = out.demand if out.demand is not None else self.p("flow")
-            if out.demand is None and self._ctx.final:
+            if out.demand is None and self._ctx.final and not self.pf:
                 self.warn("Flow is 'As required' but nothing downstream requests a flow; "
                           "the starting estimate was used.")
         out.set(m, st.P, st.h)
+        m = out.m
         self.result("flow", "Flow supplied", m, "mass_flow")
         self.result("temperature", "Temperature", st.T, "temperature")
         self.result("condition", "Condition", st.describe(), "text")
         self.step("Supply conditions",
                   text=(f"{st.describe()} at {fmt(st.P)} kPa(a) and {fmt(st.T)} °C. "
-                        + ("Flow fixed by the user." if self.p("flow_mode") == "Fixed"
+                        + ("Flow fixed by the user." if mode == "Fixed"
+                           else "Flow found from the pressure–flow balance." if self.pf
                            else "Flow set by what the downstream equipment requires.")),
                   result=rf"h = {_kj(st.h)}, \quad \dot m = {num(m, 5)}{unit('kg/s')}")
 
@@ -87,6 +123,60 @@ class Feed(Block):
         out = self.s_out("out")
         m = self.p("flow") if self.p("flow_mode") == "Fixed" else (out.demand or self.p("flow"))
         return st.P, st.h, m
+
+    def hydraulics(self, net):
+        out = self.s_out("out")
+        net.pressure(out, self._state().P, "supply pressure")
+        if self.p("flow_mode") == "Fixed":
+            net.flow(out, self.p("flow"), "supply flow (fixed)")
+
+
+@register
+class Sink(Block):
+    TYPE = "sink"
+    LABEL = "Product / sink"
+    CATEGORY = "Supplies"
+    DESCRIPTION = ("Where a line leaves the system: a drain, the atmosphere, a tank or another plant's header. "
+                   "In pressure–flow mode its pressure (or flow) sets how much flows into it.")
+    INLETS = [Port("in", "Inlet")]
+    OUTLETS = []
+    PARAMS = [
+        Param("mode", "Specify", "choice", "Pressure", choices=("Pressure", "Flow"),
+              help="Pressure: the line discharges at this pressure and the flow follows from the hydraulics "
+                   "(pressure–flow mode). Flow: this flow is drawn from the line."),
+        Param("pressure", "Pressure", "pressure", P_ATM_KPA, show_if=("mode", ("Pressure",))),
+        Param("flow", "Flow", "mass_flow", 1.0, min_value=0.0, show_if=("mode", ("Flow",))),
+    ]
+
+    def update_demands(self):
+        if self.p("mode") == "Flow":
+            self.s_in("in").demand = self.p("flow")
+
+    def calculate(self):
+        sin = self.s_in("in")
+        st = sin.state
+        self.result("flow", "Flow", sin.m, "mass_flow")
+        self.result("P", "Arrival pressure", sin.P, "pressure")
+        self.result("T", "Temperature", st.T, "temperature")
+        self.result("condition", "Condition", st.describe(), "text")
+        if self.p("mode") == "Pressure":
+            target = self.p("pressure")
+            self.result("margin", "Arrival pressure minus sink pressure", sin.P - target, "pressure_diff")
+            if not self.pf and abs(sin.P - target) > max(0.5, 0.005 * target):
+                self.warn(f"The line arrives at {fmt(sin.P)} kPa(a) but the sink is at {fmt(target)} kPa(a). "
+                          "In pressure–flow mode the flow would change until they match.")
+        elif not self.pf and abs(sin.m - self.p("flow")) > 1e-6 * max(1.0, self.p("flow")):
+            self.warn(f"{fmt(sin.m)} kg/s arrives but {fmt(self.p('flow'))} kg/s is drawn: set the upstream "
+                      "supply to 'As required'.")
+        self.step("Discharge", text=f"{st.describe()} leaves the system at {fmt(sin.P)} kPa(a).",
+                  result=rf"\dot m = {num(sin.m, 5)}{unit('kg/s')}, \quad h = {_kj(sin.h)}")
+
+    def hydraulics(self, net):
+        sin = self.s_in("in")
+        if self.p("mode") == "Pressure":
+            net.pressure(sin, self.p("pressure"), "sink pressure")
+        else:
+            net.flow(sin, self.p("flow"), "flow drawn by the sink")
 
 
 # --- pressure changers ------------------------------------------------------------
@@ -133,24 +223,47 @@ class Pump(Block):
             if qr <= 0:
                 raise ValueError("Enter a rated flow greater than zero for the pump curve.")
             r = q / qr
-            head = h0 - (h0 - hr) * r * r
+            head = self._curve_head(q)
             if head <= 0:
                 raise ValueError(f"The flow ({fmt(q)} m³/h) is beyond the end of the pump curve (head falls to zero).")
             eta = max(self.p("efficiency") / 100.0 * (2 * r - r * r), 0.05) if q > 0 else self.p("efficiency") / 100.0
             return sin.P + st1.rho * 9.80665 * head / 1000.0, eta, (q, head, r)
         return self.p("outlet_pressure"), self.p("efficiency") / 100.0, None
 
+    def _curve_head(self, q: float) -> float:
+        h0, qr, hr = self.p("shutoff_head"), self.p("rated_flow"), self.p("rated_head")
+        if qr <= 0:
+            raise ValueError("Enter a rated flow greater than zero for the pump curve.")
+        r = q / qr
+        return h0 - (h0 - hr) * r * abs(r)  # mirrored for reverse flow so the head keeps rising
+
+    def _imposed(self, sin, st1):
+        """Pressure–flow mode: the outlet pressure comes from the network; find the efficiency."""
+        P2 = self.s_out("out").P
+        eta = self.p("efficiency") / 100.0
+        curve = None
+        if self.p("mode") == "Pump curve":
+            q = sin.m / st1.rho * 3600.0
+            r = q / self.p("rated_flow") if self.p("rated_flow") > 0 else 0.0
+            if q > 0:
+                eta = max(eta * (2 * r - r * r), 0.05)
+            curve = (q, (P2 - sin.P) * 1000.0 / (st1.rho * 9.80665), r)
+            if curve[1] <= 0:
+                self.warn(f"The flow ({fmt(q)} m³/h) is beyond the end of the pump curve: the pump no longer adds "
+                          "pressure.")
+        return P2, eta, curve
+
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
         st1 = sin.state
-        P2, eta, curve = self._outlet_pressure(sin, st1)
-        if P2 < sin.P - TOL_P:
+        P2, eta, curve = self._imposed(sin, st1) if self.pf else self._outlet_pressure(sin, st1)
+        if P2 < sin.P - TOL_P and not self.pf:
             raise ValueError(f"Outlet pressure ({fmt(P2)} kPa(a)) is below the inlet pressure ({fmt(sin.P)} kPa(a)).")
         if st1.phase in ("vapour", "saturated vapour") or (st1.phase == "two-phase" and st1.x > 1e-4):
             self.warn("The pump inlet contains steam. Pumps need subcooled water to avoid cavitation.")
         eta_m = self.p("motor_efficiency") / 100.0
         h2s = state_Ps(P2, st1.s).h
-        h2 = st1.h + (h2s - st1.h) / eta
+        h2 = st1.h + (h2s - st1.h) / eta if P2 >= sin.P else st1.h
         W = sin.m * (h2 - st1.h)
         out.set(sin.m, P2, h2)
         st2 = out.state
@@ -218,6 +331,26 @@ class Pump(Block):
             return self.p("outlet_pressure"), state_Px(101.325, 0.0).h, 0.0
         return None
 
+    def hydraulics(self, net):
+        sin, out = self.s_in("in"), self.s_out("out")
+        net.same_flow(sin, out, "same flow in and out")
+        mode = self.p("mode")
+        if mode == "Outlet pressure":
+            net.pressure(out, self.p("outlet_pressure"), "pump outlet pressure")
+        elif mode == "Pressure rise":
+            net.pressure_diff(out, sin, self.p("pressure_rise"), "pump pressure rise")
+        else:
+            h_in = sin.h
+
+            def outlet(m, P1, h_in=h_in):
+                rho = state_Ph(P1, h_in).rho
+                return P1 + rho * 9.80665 * self._curve_head(m / rho * 3600.0) / 1000.0
+
+            rho0 = sin.state.rho
+            net.element(sin, out, outlet, "pump curve",
+                        scale=max(rho0 * 9.80665 * self.p("shutoff_head") / 1000.0, 1.0),
+                        m_nominal=self.p("rated_flow") * rho0 / 3600.0)
+
 
 @register
 class Compressor(Block):
@@ -273,6 +406,10 @@ class Compressor(Block):
             return P2, sin.h, sin.m
         return P2, state_Px(min(P2, P_CRIT_KPA - 1), 1.0).h, 0.0
 
+    def hydraulics(self, net):
+        net.same_flow(self.s_in("in"), self.s_out("out"), "same flow in and out")
+        net.pressure(self.s_out("out"), self.p("outlet_pressure"), "compressor outlet pressure")
+
 
 def _inverse_characteristic(fraction: float, kind: str, rangeability: float = 50.0) -> float:
     """Opening (0–1) that gives a fraction of the rated Cv."""
@@ -296,8 +433,13 @@ class Valve(Block):
     OUTLETS = [Port("out", "Outlet")]
     PARAMS = [
         Param("mode", "Specify", "choice", "Outlet pressure",
-              choices=("Outlet pressure", "Pressure drop", "Cv and opening")),
-        Param("outlet_pressure", "Outlet pressure", "pressure", 201.325, show_if=("mode", ("Outlet pressure",))),
+              choices=("Outlet pressure", "Pressure drop", "Cv and opening", "Free pressure drop (steam trap / flow controller)"),
+              help="Outlet pressure: a pressure controller (PRV). Cv and opening: a valve in a fixed position. "
+                   "Free pressure drop: a steam trap or flow controller that passes whatever flow arrives; in "
+                   "pressure–flow mode its outlet pressure comes from downstream (the back pressure)."),
+        Param("outlet_pressure", "Outlet pressure", "pressure", 201.325,
+              show_if=("mode", ("Outlet pressure", "Free pressure drop (steam trap / flow controller)")),
+              help="For a free pressure drop this is only used in sequential mode."),
         Param("pressure_drop", "Pressure drop", "pressure_diff", 100.0, min_value=0.0,
               show_if=("mode", ("Pressure drop",))),
         Param("cv", "Rated Cv (fully open; 0 = not known)", "number", 0.0, min_value=0.0, group="Valve data",
@@ -325,10 +467,30 @@ class Valve(Block):
             return P2, (cv, sizing)
         return self.p("outlet_pressure"), None
 
+    def _rated_cv_open(self) -> float:
+        return self.p("cv") * characteristic(1.0, self.p("characteristic"))
+
+    def _cv_in_use(self) -> float:
+        return self.p("cv") * characteristic(self.p("opening") / 100.0, self.p("characteristic"))
+
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
         st1 = sin.state
-        P2, cv_mode = self._outlet(sin, st1)
+        if self.pf:
+            P2 = out.P
+            cv_mode = None
+            if self.p("mode") == "Cv and opening" or self.pf_state.get("wide_open"):
+                cv = self._cv_in_use() if self.p("mode") == "Cv and opening" else self._rated_cv_open()
+                cv_mode = (cv, valve_cv_required(sin.m, st1, P2, self.p("fl"), self.p("xt"))) if P2 < sin.P else None
+            if self.pf_state.get("wide_open"):
+                self.warn(f"The valve is fully open and cannot hold its set pressure of {fmt(self.p('outlet_pressure'))} "
+                          f"kPa(a): the outlet is at {fmt(P2)} kPa(a). The supply pressure is too low or the valve too "
+                          "small for this flow.")
+            if self.p("mode") == "Free pressure drop (steam trap / flow controller)" and P2 > sin.P + TOL_P:
+                raise ValueError(f"The back pressure ({fmt(P2)} kPa(a)) is above the inlet pressure ({fmt(sin.P)} "
+                                 "kPa(a)): this trap or valve cannot discharge.")
+        else:
+            P2, cv_mode = self._outlet(sin, st1)
         if P2 <= 0:
             raise ValueError("The pressure drop is larger than the inlet pressure.")
         if P2 > sin.P + TOL_P:
@@ -352,6 +514,8 @@ class Valve(Block):
         if cv_mode is not None:
             cv, sizing = cv_mode
             self.result("cv", "Cv in use (rated × characteristic)", cv, "number")
+            if self.pf:
+                self.result("flow", "Flow through the valve", sin.m, "mass_flow")
         else:
             sizing = valve_cv_required(sin.m, st1, P2, self.p("fl"), self.p("xt"))
             cv = sizing.cv
@@ -402,10 +566,80 @@ class Valve(Block):
             except ValueError:
                 P2 = sin.P * 0.9
             return P2, sin.h, sin.m
-        if self.p("mode") == "Outlet pressure":
+        if self.p("mode") in ("Outlet pressure", "Free pressure drop (steam trap / flow controller)"):
             P2 = self.p("outlet_pressure")
             return P2, state_Px(min(P2, P_CRIT_KPA - 1), 1.0).h, 0.0
         return None
+
+    def _flow_equation(self, net, sin, out, cv: float, why: str):
+        h_in, fl, xt = sin.h, self.p("fl"), self.p("xt")
+
+        def flow(P1, P2, h_in=h_in):
+            return valve_flow(state_Ph(P1, h_in), P2, cv, fl, xt)
+
+        net.flow_from_pressures(sin, out, flow, why)
+
+    def hydraulics(self, net):
+        sin, out = self.s_in("in"), self.s_out("out")
+        net.same_flow(sin, out, "same flow in and out")
+        mode = self.p("mode")
+        if mode == "Pressure drop":
+            net.pressure_diff(sin, out, self.p("pressure_drop"), "valve pressure drop")
+        elif mode == "Cv and opening":
+            cv = self._cv_in_use()
+            if cv <= 0:
+                raise ValueError("Enter the valve's rated Cv (and an opening above zero).")
+            self._flow_equation(net, sin, out, cv, f"valve Cv {fmt(cv, 3)}")
+        elif mode == "Outlet pressure":
+            if self.pf_state.get("wide_open"):
+                self._flow_equation(net, sin, out, self._rated_cv_open(), "valve fully open (cannot hold its set pressure)")
+            else:
+                net.pressure(out, self.p("outlet_pressure"), "valve set (outlet) pressure")
+        # free pressure drop: the outlet pressure is set by what is downstream
+
+    def diagnose(self, net, x) -> str | None:
+        mode = self.p("mode")
+        if mode == "Cv and opening":
+            cv = self._cv_in_use()
+        elif mode == "Outlet pressure" and self.pf_state.get("wide_open"):
+            cv = self._rated_cv_open()
+        else:
+            return None
+        sin = self.s_in("in")
+        m, P1 = x[net.im(sin)], x[net.ip(sin)]
+        try:
+            cap = valve_flow(state_Ph(P1, sin.h), 1.0, cv, self.p("fl"), self.p("xt"))
+        except (ValueError, ArithmeticError):
+            return None
+        if m > cap * 1.0001:
+            return (f"{self.name} cannot pass the flow needed ({fmt(m * 3600, 4)} kg/h): even fully open its "
+                    f"capacity is {fmt(cap * 3600, 4)} kg/h, because the flow through it is choked at "
+                    f"{fmt(P1)} kPa(a) inlet pressure. Use a larger valve (Cv) or raise the supply pressure.")
+        return None
+
+    def check_active_set(self, net, x) -> bool:
+        """A pressure-reducing valve with a known Cv runs wide open when it cannot pass the flow at its set
+        pressure, and goes back to regulating when the outlet pressure would rise above the set pressure."""
+        if self.p("mode") != "Outlet pressure" or self.p("cv") <= 0:
+            return False
+        sin, out = self.s_in("in"), self.s_out("out")
+        m, P1, P2 = x[net.im(sin)], x[net.ip(sin)], x[net.ip(out)]
+        P_set = self.p("outlet_pressure")
+        if not self.pf_state.get("wide_open"):
+            if m <= 0:
+                return False
+            if P1 <= P_set:
+                self.pf_state["wide_open"] = True
+                return True
+            need = valve_cv_required(m, state_Ph(P1, sin.h), P_set, self.p("fl"), self.p("xt")).cv
+            if need > self._rated_cv_open() * 1.001:
+                self.pf_state["wide_open"] = True
+                return True
+            return False
+        if P2 > P_set * (1 + 1e-6) + 1e-6:
+            self.pf_state["wide_open"] = False
+            return True
+        return False
 
 
 @register
@@ -470,6 +704,86 @@ class Turbine(Block):
             return P2, sin.h - self.p("efficiency") / 100.0 * (sin.h - h2s), sin.m
         return P2, state_Px(min(P2, P_CRIT_KPA - 1), 1.0).h, 0.0
 
+    def hydraulics(self, net):
+        net.same_flow(self.s_in("in"), self.s_out("out"), "same flow in and out")
+        net.pressure(self.s_out("out"), self.p("outlet_pressure"), "turbine exhaust pressure")
+
+
+@register
+class CheckValve(Block):
+    TYPE = "check_valve"
+    LABEL = "Check (non-return) valve"
+    CATEGORY = "Pressure change"
+    DESCRIPTION = ("Lets water or steam flow one way only. In pressure–flow mode it closes when the downstream "
+                   "pressure would push flow backwards.")
+    INLETS = [Port("in", "Inlet")]
+    OUTLETS = [Port("out", "Outlet")]
+    PARAMS = [
+        Param("cv", "Cv when open", "number", 100.0, min_value=1e-6,
+              help="Flow coefficient of the open valve (from the manufacturer)."),
+        Param("cracking", "Cracking (opening) pressure", "pressure_diff", 3.5, min_value=0.0),
+        Param("fl", "Liquid pressure recovery factor FL", "number", 0.9, min_value=0.3, max_value=1.0),
+        Param("xt", "Pressure differential ratio factor xT", "number", 0.7, min_value=0.1, max_value=1.0),
+    ]
+
+    def calculate(self):
+        sin, out = self.s_in("in"), self.s_out("out")
+        st1 = sin.state
+        closed = self.pf and self.pf_state.get("closed")
+        if self.pf:
+            P2 = out.P
+        elif sin.m > 0:
+            P_in_eff = sin.P - self.p("cracking")
+            if P_in_eff <= 0:
+                raise ValueError("The cracking pressure is larger than the inlet pressure.")
+            P2, _ = valve_outlet_pressure(sin.m, state_Ph(P_in_eff, sin.h), self.p("cv"), self.p("fl"), self.p("xt"))
+        else:
+            P2 = sin.P
+        out.set(sin.m, P2, sin.h)
+        self.result("state", "Position", "Closed" if closed else "Open", "text")
+        self.result("dP", "Pressure drop", sin.P - P2, "pressure_diff")
+        self.result("flow", "Flow", sin.m, "mass_flow")
+        self.step("Check valve",
+                  text=("Closed: the downstream pressure is higher than the upstream pressure, so there is no flow."
+                        if closed else
+                        f"Open: the flow passes with the cracking pressure ({fmt(self.p('cracking'))} kPa) plus the "
+                        f"loss of a valve with Cv {fmt(self.p('cv'), 3)}."),
+                  equation=r"\Delta P = \Delta P_{crack} + \Delta P(C_v,\ \dot m)",
+                  result=rf"\Delta P = {num(sin.P - P2, 4)}{unit('kPa')}")
+
+    def update_demands(self):
+        self.pass_demand_through()
+
+    def initial_guess(self, port):
+        sin = self.s_in("in")
+        return (sin.P - self.p("cracking"), sin.h, sin.m) if sin.known else None
+
+    def hydraulics(self, net):
+        sin, out = self.s_in("in"), self.s_out("out")
+        net.same_flow(sin, out, "same flow in and out")
+        if self.pf_state.get("closed"):
+            net.flow(out, 0.0, "check valve closed")
+            return
+        h_in, cv, crack, fl, xt = sin.h, self.p("cv"), self.p("cracking"), self.p("fl"), self.p("xt")
+
+        def flow(P1, P2, h_in=h_in):
+            P1e = P1 - crack
+            return valve_flow(state_Ph(max(P1e, 1.0), h_in), P2, cv, fl, xt) if P1e > 1.0 else -1.0
+
+        net.flow_from_pressures(sin, out, flow, "check valve open")
+
+    def check_active_set(self, net, x) -> bool:
+        sin, out = self.s_in("in"), self.s_out("out")
+        if self.pf_state.get("closed"):
+            if x[net.ip(sin)] - x[net.ip(out)] > self.p("cracking") * 1.001 + 1e-6:
+                self.pf_state["closed"] = False
+                return True
+            return False
+        if x[net.im(sin)] < 0:
+            self.pf_state["closed"] = True
+            return True
+        return False
+
 
 # --- heat transfer ------------------------------------------------------------------
 
@@ -481,7 +795,7 @@ class Boiler(Block):
     CATEGORY = "Heat transfer"
     DESCRIPTION = ("Turns feedwater into saturated or superheated steam. Reports heat duty and fuel input, "
                    "with optional continuous blowdown.")
-    INLETS = [Port("in", "Feedwater")]
+    INLETS = [Port("in", "Feedwater", open_option=True)]
     OUTLETS = [Port("steam", "Steam"), Port("blowdown", "Blowdown", optional=True)]
     PARAMS = [
         Param("pressure", "Steam pressure", "pressure", 1101.325),
@@ -559,6 +873,20 @@ class Boiler(Block):
             return P, self._steam_state().h, steam.demand or 0.0
         return P, state_Px(min(P, P_CRIT_KPA - 1), 0.0).h, 0.0
 
+    def hydraulics(self, net):
+        fw, steam, bd_out = self.s_in("in"), self.s_out("steam"), self.s_out("blowdown")
+        P = self.p("pressure")
+        bd = self.p("blowdown") / 100.0
+        net.pressure(steam, P, "boiler (drum) pressure")
+        if bd_out is not None:
+            net.pressure(bd_out, P, "blowdown at boiler pressure")
+            net.flow_ratio(bd_out, fw, bd, "blowdown fraction")
+            net.mass_balance([fw], [steam, bd_out], "boiler mass balance")
+        else:
+            net.same_flow(fw, steam, "steam flow = feedwater flow")
+        if self.inlet_open(fw.name):
+            net.pressure(fw, P, "feedwater arrives at drum pressure (open inlet)")
+
 
 @register
 class Heater(Block):
@@ -577,11 +905,12 @@ class Heater(Block):
               min_value=0.0, max_value=1.0),
         Param("duty", "Heat duty (+ heating, − cooling)", "power", 1000.0, show_if=("spec", ("Heat duty",))),
         Param("pressure_drop", "Pressure drop", "pressure_diff", 0.0, min_value=0.0),
+        *dp_params(),
     ]
 
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
-        P2 = sin.P - self.p("pressure_drop")
+        P2 = _outlet_after_dp(self, sin, out)
         if P2 <= 0:
             raise ValueError("The pressure drop is larger than the inlet pressure.")
         spec = self.p("spec")
@@ -621,6 +950,34 @@ class Heater(Block):
     def update_demands(self):
         self.pass_demand_through()
 
+    def hydraulics(self, net):
+        _dp_equations(self, net, self.s_in("in"), self.s_out("out"))
+
+
+def _outlet_after_dp(block: Block, sin, out, prefix: str = "", dp_key: str = "pressure_drop") -> float:
+    """Outlet pressure after a fixed or flow-dependent pressure drop (imposed in pressure–flow mode)."""
+    if block.pf:
+        return out.P
+    if block.p(f"{prefix}dp_mode") == "Fixed":
+        return sin.P - block.p(dp_key)
+    return sin.P - flow_dp(sin.m, sin.state.rho, block.p(dp_key), block.p(f"{prefix}rated_flow"),
+                           block.p(f"{prefix}rated_density"))
+
+
+def _dp_equations(block: Block, net, sin, out, prefix: str = "", dp_key: str = "pressure_drop",
+                  side: str = "") -> None:
+    net.same_flow(sin, out, f"{side}same flow in and out")
+    if block.p(f"{prefix}dp_mode") == "Fixed":
+        net.pressure_diff(sin, out, block.p(dp_key), f"{side}fixed pressure drop")
+        return
+    h_in, dp_r, m_r, rho_r = sin.h, block.p(dp_key), block.p(f"{prefix}rated_flow"), block.p(f"{prefix}rated_density")
+
+    def outlet(m, P1, h_in=h_in):
+        return P1 - flow_dp(m, state_Ph(P1, h_in).rho, dp_r, m_r, rho_r)
+
+    net.element(sin, out, outlet, f"{side}pressure drop ∝ flow²", scale=max(dp_r, 1e-3 * net.P_ref, 1e-3),
+                m_nominal=m_r)
+
 
 @register
 class Condenser(Block):
@@ -634,11 +991,12 @@ class Condenser(Block):
         Param("subcooling", "Condensate subcooling", "temperature_diff", 0.0, min_value=0.0),
         Param("pressure_drop", "Pressure drop", "pressure_diff", 0.0, min_value=0.0),
         Param("cw_rise", "Cooling water temperature rise", "temperature_diff", 10.0, min_value=0.1),
+        *dp_params(),
     ]
 
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
-        P2 = sin.P - self.p("pressure_drop")
+        P2 = _outlet_after_dp(self, sin, out)
         if P2 <= 0:
             raise ValueError("The pressure drop is larger than the inlet pressure.")
         sub = self.p("subcooling")
@@ -661,6 +1019,9 @@ class Condenser(Block):
     def update_demands(self):
         self.pass_demand_through()
 
+    def hydraulics(self, net):
+        _dp_equations(self, net, self.s_in("in"), self.s_out("out"))
+
 
 # --- mixing and splitting ------------------------------------------------------------
 
@@ -675,7 +1036,10 @@ class Mixer(Block):
     OUTLETS = [Port("out", "Outlet")]
     PARAMS = [
         Param("pressure_mode", "Outlet pressure", "choice", "Lowest inlet pressure",
-              choices=("Lowest inlet pressure", "Specified")),
+              choices=("Lowest inlet pressure", "Specified", "Equal pressures (junction)"),
+              help="Lowest inlet pressure: higher-pressure inlets are throttled down to it. Equal pressures: a "
+                   "plain pipe junction; in pressure–flow mode the inlet flows adjust until their pressures "
+                   "match (e.g. where parallel branches rejoin)."),
         Param("pressure", "Outlet pressure", "pressure", P_ATM_KPA, show_if=("pressure_mode", ("Specified",))),
     ]
 
@@ -685,13 +1049,20 @@ class Mixer(Block):
         H = sum(s.m * s.h for s in ins)
         h = H / m if m > 1e-12 else sum(s.h for s in ins) / len(ins)
         p_min = min(s.P for s in ins)
-        if self.p("pressure_mode") == "Specified":
+        mode = self.p("pressure_mode")
+        if self.pf:
+            P = out.P
+        elif mode == "Specified":
             P = self.p("pressure")
             if P > p_min + TOL_P:
                 self.warn(f"Specified outlet pressure is above the lowest inlet pressure ({fmt(p_min)} kPa(a)); "
                           "that inlet could not flow in.")
         else:
             P = p_min
+            p_max = max(s.P for s in ins)
+            if mode.startswith("Equal") and p_max - p_min > max(0.5, 0.005 * p_max):
+                self.warn(f"The inlets arrive at different pressures ({fmt(p_min)} to {fmt(p_max)} kPa(a)). In "
+                          "pressure–flow mode their flows would adjust until the pressures match.")
         out.set(m, P, h)
         st = out.state
         self.result("flow", "Total flow", m, "mass_flow")
@@ -701,6 +1072,41 @@ class Mixer(Block):
                   equation=r"\dot m = \sum \dot m_i, \qquad h = \frac{\sum \dot m_i h_i}{\dot m}",
                   substitution=rf"h = \frac{{{num(H, 6)}}}{{{num(m, 5)}}}",
                   result=rf"\dot m = {num(m, 5)}{unit('kg/s')}, \quad h = {_kj(h)} \quad {tex_text('(' + st.describe() + ')')}")
+
+    def _active_inlet(self, P: dict) -> str:
+        """Lowest-pressure inlet (with a little hysteresis so the choice doesn't flip back and forth)."""
+        names = [s.name for s in self.s_ins("in")]
+        cur = self.pf_state.get("active")
+        best = min(names, key=lambda n: (P[n], names.index(n)))
+        if cur in names and P[cur] <= P[best] + 1e-6 * max(P[best], 1.0):
+            return cur
+        return best
+
+    def hydraulics(self, net):
+        ins, out = self.s_ins("in"), self.s_out("out")
+        net.mass_balance(ins, [out], "mass balance")
+        mode = self.p("pressure_mode")
+        if mode == "Specified":
+            net.pressure(out, self.p("pressure"), "mixer outlet pressure (specified)")
+        elif mode.startswith("Equal"):
+            for s in ins:
+                net.same_pressure(s, out, f"inlet '{s.name}' at the junction pressure")
+        else:
+            act = self.pf_state.get("active")
+            if act not in [s.name for s in ins]:
+                act = self._active_inlet({s.name: s.P for s in ins})
+                self.pf_state["active"] = act
+            net.same_pressure(act, out, f"outlet at the lowest inlet pressure ('{act}')")
+
+    def check_active_set(self, net, x) -> bool:
+        if self.p("pressure_mode") != "Lowest inlet pressure":
+            return False
+        P = {s.name: x[net.ip(s)] for s in self.s_ins("in")}
+        new = self._active_inlet(P)
+        if new != self.pf_state.get("active"):
+            self.pf_state["active"] = new
+            return True
+        return False
 
 
 @register
@@ -717,7 +1123,7 @@ class Splitter(Block):
     def calculate(self):
         sin = self.s_in("in")
         outs = self.s_outs("out")
-        flows = allocate_outlets(self, sin.m, outs)
+        flows = {s.name: s.m for s in outs} if self.pf else allocate_outlets(self, sin.m, outs)
         for s in outs:
             s.set(flows[s.name], sin.P, sin.h)
             self.result(f"flow:{s.name}", f"Flow to {s.name}", flows[s.name], "mass_flow")
@@ -727,7 +1133,10 @@ class Splitter(Block):
             spec = specs.get(s.name) or {"mode": "Remainder"}
             mode = spec.get("mode", "Remainder")
             desc = {"Flow": f"Fixed {fmt(spec.get('value'))} kg/s", "Fraction": f"{fmt(spec.get('value'))} %",
-                    "As required": "As required downstream", "Remainder": "Remainder"}.get(mode, mode)
+                    "As required": "As required downstream", "Remainder": "Remainder",
+                    "Pressure-driven": "Set by the pressure–flow balance"}.get(mode, mode)
+            if self.pf and mode in ("As required", "Remainder"):
+                desc += " (pressure–flow balance)"
             rows.append([s.name, desc, fmt(flows[s.name], 5)])
         self.step("Flow split", text="All outlets have the same pressure and enthalpy as the inlet.", table=rows)
 
@@ -747,6 +1156,27 @@ class Splitter(Block):
         sin = self.s_in("in")
         return (sin.P, sin.h, 0.0) if sin.known else None
 
+    def hydraulics(self, net):
+        sin, outs = self.s_in("in"), self.s_outs("out")
+        net.mass_balance([sin], outs, "mass balance")
+        for s in outs:
+            net.same_pressure(sin, s, f"outlet '{s.name}' at the inlet pressure")
+        _outlet_spec_equations(self, net, sin, outs)
+
+
+def _outlet_spec_equations(block: Block, net, total_ref, outs) -> None:
+    """Fixed-flow and fraction outlet specifications (others are found by the network)."""
+    specs = block.params.get("outlet_specs") or {}
+    for s in outs:
+        spec = specs.get(s.name) or {"mode": "Remainder"}
+        mode = spec.get("mode", "Remainder")
+        if mode == "Flow":
+            net.flow(s, float(spec.get("value") or 0.0), f"outlet '{s.name}' fixed flow")
+        elif mode == "Fraction":
+            if total_ref is None:
+                raise ValueError("Percentage outlet specifications need a single inlet.")
+            net.flow_ratio(s, total_ref, float(spec.get("value") or 0.0) / 100.0, f"outlet '{s.name}' percentage")
+
 
 @register
 class Header(Block):
@@ -755,10 +1185,13 @@ class Header(Block):
     CATEGORY = "Mixing and splitting"
     DESCRIPTION = ("A steam main at a set pressure that collects steam from supplies and distributes it to users. "
                    "Pick a balancing supply (e.g. the boiler or a PRV) that makes up whatever the users need.")
-    INLETS = [Port("in", "Steam supplies", multiple=True)]
+    INLETS = [Port("in", "Steam supplies", multiple=True, open_option=True)]
     OUTLETS = [Port("out", "Steam users", multiple=True, with_specs=True)]
     PARAMS = [
-        Param("pressure", "Header pressure", "pressure", 1101.325),
+        Param("pressure_mode", "Pressure", "choice", "Set pressure", choices=("Set pressure", "Calculated (junction)"),
+              help="Set pressure: the header is held at its pressure (supplies are throttled into it). Calculated: "
+                   "in pressure–flow mode the header is a plain junction whose pressure follows from the flows."),
+        Param("pressure", "Header pressure", "pressure", 1101.325, show_if=("pressure_mode", ("Set pressure",))),
         Param("balancing_inlet", "Balancing supply", "inlet_choice", "", inlet_port="in",
               help="This supply makes up the difference between what the users need and what the other "
                    "supplies provide."),
@@ -767,14 +1200,20 @@ class Header(Block):
     def calculate(self):
         ins = self.s_ins("in")
         outs = self.s_outs("out")
-        P = self.p("pressure")
+        junction = self.p("pressure_mode").startswith("Calculated")
+        if self.pf:
+            P = outs[0].P if outs else self.p("pressure")
+        elif junction:
+            P = min(s.P for s in ins)
+        else:
+            P = self.p("pressure")
         for s in ins:
             if s.P < P - 1e-3:
                 self.warn(f"Supply '{s.name}' ({fmt(s.P)} kPa(a)) is below the header pressure and could not flow in.")
         m = sum(s.m for s in ins)
         H = sum(s.m * s.h for s in ins)
         h = H / m if m > 1e-12 else sum(s.h for s in ins) / len(ins)
-        flows = allocate_outlets(self, m, outs)
+        flows = {s.name: s.m for s in outs} if self.pf else allocate_outlets(self, m, outs)
         for s in outs:
             s.set(flows[s.name], P, h)
         st = state_Ph(P, h)
@@ -789,6 +1228,8 @@ class Header(Block):
         rows = [["Stream", "Direction", "Flow (kg/s)", "h (kJ/kg)"]]
         rows += [[s.name, "in" + (" (balancing)" if s.name == bal else ""), fmt(s.m, 5), fmt(s.h, 5)] for s in ins]
         rows += [[s.name, "out", fmt(flows[s.name], 5), fmt(h, 5)] for s in outs]
+        if self.pf:
+            self.result("P", "Header pressure", P, "pressure")
         self.step("Header balance",
                   text=(f"Supplies mix at the header pressure of {fmt(P)} kPa(a) (any supply at higher pressure is "
                         f"throttled at constant enthalpy). Header steam: {st.describe().lower()}."),
@@ -796,6 +1237,22 @@ class Header(Block):
                   substitution=rf"h = \frac{{{num(H, 6)}}}{{{num(m, 5)}}}",
                   result=rf"h = {_kj(h)}, \quad T = {num(st.T, 4)}{unit('°C')}",
                   table=rows)
+
+    def hydraulics(self, net):
+        ins, outs = self.s_ins("in"), self.s_outs("out")
+        net.mass_balance(ins, outs, "header mass balance")
+        if self.p("pressure_mode").startswith("Calculated"):
+            ports = ins + outs
+            for s in ports[1:]:
+                net.same_pressure(ports[0], s, f"'{s.name}' at the junction pressure")
+        else:
+            P = self.p("pressure")
+            for s in outs:
+                net.pressure(s, P, f"user '{s.name}' at the header pressure")
+            for s in ins:
+                if self.inlet_open(s.name):
+                    net.pressure(s, P, f"supply '{s.name}' arrives at header pressure (open inlet)")
+        _outlet_spec_equations(self, net, ins[0] if len(ins) == 1 else None, outs)
 
     def update_demands(self):
         bal = self.p("balancing_inlet")
@@ -827,9 +1284,25 @@ class FlashVessel(Block):
     CATEGORY = "Steam system"
     DESCRIPTION = ("Drops hot condensate (or blowdown) to a lower pressure and separates the flash steam from "
                    "the remaining water.")
-    INLETS = [Port("in", "Inlet")]
+    INLETS = [Port("in", "Inlet", open_option=True)]
     OUTLETS = [Port("vapour", "Flash steam"), Port("liquid", "Water")]
     PARAMS = [Param("pressure", "Vessel pressure", "pressure", 201.325)]
+
+    def _fraction(self, h: float) -> float:
+        st = state_Ph(self.p("pressure"), h)
+        if st.phase == "two-phase":
+            return st.x
+        return 1.0 if st.is_vapour_like else 0.0
+
+    def hydraulics(self, net):
+        sin, vap, liq = self.s_in("in"), self.s_out("vapour"), self.s_out("liquid")
+        P = self.p("pressure")
+        net.pressure(vap, P, "flash steam at vessel pressure")
+        net.pressure(liq, P, "water at vessel pressure")
+        net.flow_ratio(vap, sin, self._fraction(sin.h), "flash fraction")
+        net.mass_balance([sin], [vap, liq], "vessel mass balance")
+        if self.inlet_open(sin.name):
+            net.pressure(sin, P, "inlet arrives at vessel pressure (open inlet)")
 
     def calculate(self):
         sin = self.s_in("in")
@@ -946,7 +1419,7 @@ class Desuperheater(Block):
         self.step("Outlet",
                   equation=r"h_{out} = \frac{\dot m_s h_s + \dot m_w h_w}{\dot m_s + \dot m_w}",
                   result=rf"h_{{out}} = {_kj(h)}, \quad T_{{out}} = {num(st.T, 4)}{unit('°C')} \quad {tex_text('(' + st.describe() + ')')}")
-        if self._ctx.final and abs(water.m - mw_req) > 1e-4 * max(1.0, mw_req):
+        if self._ctx.final and not self.pf and abs(water.m - mw_req) > 1e-4 * max(1.0, mw_req):
             self.warn(f"Spray water supplied ({fmt(water.m)} kg/s) differs from the amount needed "
                       f"({fmt(mw_req)} kg/s). Set the water supply to 'As required'.")
 
@@ -956,6 +1429,19 @@ class Desuperheater(Block):
             return steam.P, self._target_h(steam.P)[0], steam.m
         return None
 
+    def hydraulics(self, net):
+        steam, water, out = self.s_in("steam"), self.s_in("water"), self.s_out("out")
+        net.same_pressure(steam, out, "outlet at the steam pressure")
+        net.mass_balance([steam, water], [out], "mass balance")
+        ht, _ = self._target_h(steam.P)
+        if steam.h <= ht:
+            net.flow(water, 0.0, "no spray water needed")
+        else:
+            if water.h >= ht:
+                raise ValueError("The spray water is hotter than the target outlet condition.")
+            net.linear_flows({water: ht - water.h, steam: -(steam.h - ht)}, 0.0,
+                             "energy balance: spray water to reach the target")
+
 
 @register
 class Deaerator(Block):
@@ -964,7 +1450,8 @@ class Deaerator(Block):
     CATEGORY = "Steam system"
     DESCRIPTION = ("Mixes water inlets with heating steam to produce saturated water at the deaerator pressure. "
                    "Calculates the heating steam needed, and the make-up water if a make-up inlet is chosen.")
-    INLETS = [Port("steam", "Heating steam"), Port("water", "Water inlets", multiple=True)]
+    INLETS = [Port("steam", "Heating steam", open_option=True),
+              Port("water", "Water inlets", multiple=True, open_option=True)]
     OUTLETS = [Port("out", "Deaerated water"), Port("vent", "Vent", optional=True)]
     PARAMS = [
         Param("pressure", "Operating pressure", "pressure", 131.325),
@@ -1068,6 +1555,26 @@ class Deaerator(Block):
         out = self.s_out("out")
         return P, hf, out.demand or 0.0
 
+    def hydraulics(self, net):
+        steam, waters = self.s_in("steam"), self.s_ins("water")
+        out, vent = self.s_out("out"), self.s_out("vent")
+        P, hf, hg, r = self._balance()
+        net.pressure(out, P, "outlet at deaerator pressure")
+        outs = [out]
+        if vent is not None:
+            net.pressure(vent, P, "vent at deaerator pressure")
+            net.flow_ratio(vent, out, r, "vent rate")
+            outs.append(vent)
+        net.mass_balance([steam] + waters, outs, "deaerator mass balance")
+        coeffs = {steam: steam.h}
+        for w in waters:
+            coeffs[w] = coeffs.get(w, 0.0) + w.h
+        coeffs[out] = -(hf + r * hg)
+        net.linear_flows(coeffs, 0.0, "energy balance: outlet saturated at deaerator pressure")
+        for s in [steam] + waters:
+            if self.inlet_open(s.name):
+                net.pressure(s, P, f"'{s.name}' arrives at deaerator pressure (open inlet)")
+
 
 @register
 class SteamUser(Block):
@@ -1091,6 +1598,24 @@ class SteamUser(Block):
         if sub > 0:
             return state_PT(P, T_sat(P) - sub).h
         return state_Px(P, 0.0).h
+
+    def hydraulics(self, net):
+        steam, cond, loss = self.s_in("in"), self.s_out("condensate"), self.s_out("loss")
+        if self.p("spec") == "Steam flow":
+            net.flow(steam, self.p("flow"), "steam flow")
+        else:
+            dh = steam.h - self._h_cond(steam.P)
+            if dh <= 1e-6:
+                raise ValueError("The inlet is not steam: it cannot deliver the heat duty by condensing.")
+            net.linear_flows({steam: dh}, self.p("duty"), "steam needed for the heat duty")
+        ret = self.p("return_percent") / 100.0
+        net.same_pressure(steam, cond, "condensate at the steam pressure")
+        if loss is not None:
+            net.same_pressure(steam, loss, "condensate at the steam pressure")
+            net.flow_ratio(cond, steam, ret, "condensate returned")
+            net.mass_balance([steam], [cond, loss], "mass balance")
+        else:
+            net.same_flow(steam, cond, "all condensate returned")
 
     def update_demands(self):
         steam = self.s_in("in")

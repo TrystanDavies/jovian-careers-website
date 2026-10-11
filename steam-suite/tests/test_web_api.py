@@ -89,3 +89,18 @@ def test_report_endpoint():
     data = client.get("/api/examples/Simple Rankine cycle (textbook)").json()
     assert "<html" in client.post("/api/report", json=data).text
     assert "# Steam system calculation" in client.post("/api/report?format=md", json=data).text
+
+
+def test_pressure_flow_solve_reports_the_network_and_accepts_a_warm_start():
+    doc = client.get("/api/examples/Cooling-water network (pressure–flow)").json()
+    assert doc["solver_mode"] == "pressure_flow"
+    r = client.post("/api/solve", json=doc).json()
+    assert r["converged"], r["errors"]
+    assert r["network"]["equations"] == r["network"]["unknowns"] > 0
+    warm = {k: [s["m"], s["P"], s["h"]] for k, s in r["streams"].items()}
+    r2 = client.post("/api/solve", json={**doc, "warm": warm}).json()
+    assert r2["converged"]
+    assert r2["network"]["newton_iterations"] == 0  # already the answer
+    cat = client.get("/api/catalog").json()
+    assert "pressure_flow" in cat["solver_modes"] and "Open" in cat["inlet_modes"]
+    assert {"sink", "check_valve", "specification"} <= {b["type"] for b in cat["blocks"]}

@@ -6,7 +6,9 @@ import math
 from dataclasses import asdict
 
 from ..flowsheet import BLOCK_TYPES, FLOW_MODES, STREAM_PROPERTIES, Flowsheet
-from ..hydraulics import FITTINGS, PIPE_SIZES, ROUGHNESS, SCHEDULES
+from ..flowsheet.core import INLET_MODES
+from ..flowsheet.solver import SOLVER_MODES
+from ..hydraulics import FITTINGS, PIPE_SIZES, ROUGHNESS, SCHEDULES, TWO_PHASE_METHODS
 from ..relief import API526_ORIFICES, FLUIDS, OVERPRESSURE_BASES, VALVE_TYPES, ReliefResult
 from ..report import CalcReport, Step
 from ..water import BACKEND, WaterState
@@ -43,6 +45,9 @@ def catalog() -> dict:
     return clean({
         "blocks": blocks,
         "flow_modes": list(FLOW_MODES),
+        "inlet_modes": list(INLET_MODES),
+        "solver_modes": SOLVER_MODES,
+        "two_phase_methods": list(TWO_PHASE_METHODS),
         "stream_properties": {k: v[0] for k, v in STREAM_PROPERTIES.items()},
         "fittings": {k: v[0] for k, v in FITTINGS.items()},
         "pipe_sizes": {k: {"od": v[0], "walls": v[1]} for k, v in PIPE_SIZES.items()},
@@ -93,6 +98,8 @@ def solve_payload(fs: Flowsheet, structure_error: str | None = None) -> dict:
         "warnings": res.warnings,
         "balance": res.balance,
         "summary": fs.summary() if not res.errors else {},
+        "solver_mode": fs.solver_mode,
+        "network": res.network,
     })
     for name, s in fs.streams.items():
         entry = {"source": list(s.source) if s.source else None, "dest": list(s.dest) if s.dest else None,

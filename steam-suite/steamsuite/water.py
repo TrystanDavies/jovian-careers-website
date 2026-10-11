@@ -220,7 +220,7 @@ def set_backend(name: str) -> None:
     """'coolprop' or 'iapws' (mainly for testing that both agree)."""
     global _use_coolprop
     _use_coolprop = name == "coolprop" and _HAVE_COOLPROP
-    for fn in (state_PT, state_Ph, state_Ps, state_Px, state_Tx, T_sat, P_sat, _sat_props):
+    for fn in (state_PT, state_Ph, state_Ps, state_Px, state_Tx, T_sat, P_sat, _sat_props, sat_transport):
         fn.cache_clear()
 
 
@@ -450,6 +450,25 @@ def P_sat(T: float) -> float:
         except (ValueError, IndexError, RuntimeError):
             pass
     return _call(T=T + 273.15, x=0.0).P * 1000.0
+
+
+@lru_cache(maxsize=100_000)
+def sat_transport(P: float) -> tuple[float, float, float, float]:
+    """(ρ_f, ρ_g, μ_f, μ_g) of saturated water and steam at P [kPa(a)]: just what two-phase friction needs,
+    without building full states (much faster inside pipe calculations)."""
+    if _use_coolprop:
+        try:
+            AS = _abstract_state()
+            AS.update(_CP.PQ_INPUTS, P * 1000.0, 0.0)
+            rf, mf = AS.rhomass(), AS.viscosity()
+            AS.update(_CP.PQ_INPUTS, P * 1000.0, 1.0)
+            rg, mg = AS.rhomass(), AS.viscosity()
+            if all(math.isfinite(v) for v in (rf, mf, rg, mg)):
+                return rf, rg, mf, mg
+        except (ValueError, IndexError, RuntimeError):
+            pass
+    liq, vap = state_Px(P, 0.0), state_Px(P, 1.0)
+    return liq.rho, vap.rho, liq.mu, vap.mu
 
 
 def surface_tension(T: float) -> float:

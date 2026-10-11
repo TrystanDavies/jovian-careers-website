@@ -45,6 +45,22 @@ def _flowsheet(data: dict) -> Flowsheet:
         raise _bad(exc) from exc
 
 
+def _warm(fs: Flowsheet, data: dict) -> None:
+    """Pressure–flow mode can start from the previous solution the browser sends ({stream: [m, P, h]})."""
+    warm = data.get("warm")
+    if not isinstance(warm, dict):
+        return
+    out = {}
+    for name, vals in warm.items():
+        try:
+            m, P, h = (float(v) for v in vals)
+        except (TypeError, ValueError):
+            continue
+        if P > 0:
+            out[name] = (m, P, h)
+    fs.warm_start = out
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
@@ -82,6 +98,7 @@ def solve(data: dict = Body(...)) -> dict:
     if not fs.blocks:
         return {"structure_error": None, "converged": True, "errors": [], "warnings": [], "streams": {}, "blocks": {},
                 "balance": {}, "summary": {}, "adjusted": {}, "empty": True}
+    _warm(fs, data)
     try:
         fs.solve()
     except (ValueError, WaterPropertyError) as exc:

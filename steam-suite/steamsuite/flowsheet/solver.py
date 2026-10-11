@@ -13,19 +13,29 @@ Each iteration does two sweeps over the equipment:
 
 Recycle loops are broken with starting estimates. Iterations continue until no
 stream flow, pressure, enthalpy or demand changes (successive substitution).
+
+Pressure–flow mode (``solver_mode = "pressure_flow"``) instead solves every
+stream's flow and pressure together from the equipment's hydraulic equations
+(see network.py), so flows follow from pressures: parallel branches share flow,
+a pump runs where its curve meets the system, a trap's back pressure comes from
+the line downstream. Enthalpies are updated by the same forward pass, with the
+flows and pressures held at the network solution, in an outer loop.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 
+import numpy as np
 from scipy.optimize import brentq
 
 from ..report import CalcReport, Step
 from ..units import fmt
 from ..water import P_CRIT_KPA, WaterPropertyError, state_Px, state_PT
 from .core import BLOCK_TYPES, STREAM_PROPERTIES, Block, SolveContext, Stream
+from .network import FAILURES, Network, NetworkError, components, loop_description
 
 
 @dataclass
@@ -36,6 +46,11 @@ class SolveResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     balance: dict[str, float] = field(default_factory=dict)
+    network: dict = field(default_factory=dict)  # pressure–flow mode: equation counts, iterations, notes
+
+
+SOLVER_MODES = {"sequential": "Sequential (flows from specifications)",
+                "pressure_flow": "Pressure–flow (flows from hydraulics)"}
 
 
 class Flowsheet:
@@ -47,6 +62,9 @@ class Flowsheet:
         self.estimates: dict[str, dict] = {}
         self.layout: dict = {}  # drawing positions: {"nodes": {name: {x, y, rot, flip}}, "streams": {...}}
         self.result: SolveResult | None = None
+        self.solver_mode = "sequential"
+        self.warm_start: dict[str, tuple[float, float, float]] = {}  # stream -> (m, P, h) from a previous solve
+        self._pf_jacobian = None  # (equation signature, Jacobian) kept between pressure–flow solves
 
     # --- building ------------------------------------------------------------
 
@@ -320,6 +338,11 @@ class Flowsheet:
         return rows
 
     def _solve_once(self, max_iterations: int, tolerance: float, warm: bool, final: bool) -> SolveResult:
+        if self.solver_mode == "pressure_flow":
+            return self._solve_pf(max_iterations, tolerance, warm, final)
+        return self._solve_sequential(max_iterations, tolerance, warm, final)
+
+    def _solve_sequential(self, max_iterations: int, tolerance: float, warm: bool, final: bool) -> SolveResult:
         if not self.blocks:
             raise ValueError("The flowsheet is empty. Add some equipment first.")
         for b in self.blocks.values():
@@ -381,6 +404,199 @@ class Flowsheet:
                                   errors=errors, warnings=warnings, balance=self.balance() if not errors else {})
         return self.result
 
+    # --- pressure–flow mode ---------------------------------------------------------------
+
+    def _solve_pf(self, max_iterations: int, tolerance: float, warm: bool, final: bool) -> SolveResult:
+        """Solve flows and pressures from the hydraulics; enthalpies by the forward pass (outer loop)."""
+        t0 = time.time()
+        if not self.blocks:
+            raise ValueError("The flowsheet is empty. Add some equipment first.")
+        for b in self.blocks.values():
+            b.validate_ports()
+        previous = self._snapshot() if warm and self.streams else {}
+        for k, (m, P, h) in (self.warm_start or {}).items():
+            previous.setdefault(k, (m, P, h, None))
+        self._build_streams()
+        if not previous or any(previous.get(k) is None or None in previous[k][:3] for k in self.streams):
+            # starting point: an ordinary sequential solve (its errors don't matter here)
+            for b in self.blocks.values():
+                b.pf_state = {}
+            try:
+                self._solve_sequential(min(max_iterations, 60), max(tolerance, 1e-5), warm=bool(previous),
+                                       final=False)
+            except ValueError:
+                pass
+            previous = self._snapshot()
+            self._build_streams()
+        for k, s in self.streams.items():
+            vals = previous.get(k)
+            if vals is not None and None not in vals[:3]:
+                s.m, s.P, s.h = vals[0], vals[1], vals[2]
+        ctx = SolveContext(self.streams, blocks=self.blocks)
+        for b in self.blocks.values():
+            b.bind(ctx)
+        for s in self.streams.values():
+            if not s.known:
+                try:
+                    self._guess(s)
+                except FAILURES:
+                    s.set(s.m or 0.0, s.P or 101.325, s.h if s.h is not None else 100.0)
+            if s.P is None or s.P <= 0:
+                s.P = 101.325
+        order = self._order()
+        names = list(self.streams)
+        n = len(names)
+        m_ref = max([abs(s.m) for s in self.streams.values()] + [1e-3])
+        P_ref = max([s.P for s in self.streams.values()] + [100.0])
+        # a typical flow for scaling: the largest flow so far, or the elements' nominal flows if all are ~zero
+        probe = Network(self.streams, m_ref, P_ref)
+        try:
+            self._pf_equations(probe)
+            nominal = [eq.surrogate[2] for eq in probe.equations if eq.surrogate and eq.surrogate[2]]
+            if nominal and m_ref < 0.01 * max(nominal):
+                m_ref = max(nominal)
+        except FAILURES:
+            pass
+        x = np.array([self.streams[k].m for k in names] + [self.streams[k].P for k in names], dtype=float)
+        info = {"mode": "pressure_flow", "equations": 0, "unknowns": 2 * n, "newton_iterations": 0,
+                "outer_iterations": 0, "notes": []}
+        errors: list[str] = []
+        converged = False
+        try:
+            for outer in range(1, 41):
+                info["outer_iterations"] = outer
+                net = Network(self.streams, m_ref, P_ref)
+                problems = self._pf_equations(net)
+                info["equations"] = len(net.equations)
+                if problems:
+                    errors.extend(problems)
+                    break
+                try:
+                    if outer == 1 and any(eq.surrogate for eq in net.equations):
+                        try:
+                            start = float(np.max(np.abs(net.residuals(x)))) if net.equations else 0.0
+                        except FAILURES:
+                            start = float("inf")
+                        if start > 1e-3:
+                            x = net.starting_point(x)
+                    sig = net.signature()
+                    J0 = self._pf_jacobian[1] if self._pf_jacobian and self._pf_jacobian[0] == sig else None
+                    x, iters, J = net.solve(x, J0=J0)
+                    self._pf_jacobian = (sig, J) if J is not None else None
+                except NetworkError as exc:
+                    causes = []
+                    for b in self.blocks.values():
+                        try:
+                            msg = b.diagnose(net, net.last_x if net.last_x is not None else x)
+                        except FAILURES:
+                            msg = None
+                        if msg:
+                            causes.append(f"{b.name}: {msg}" if not msg.startswith(b.name) else msg)
+                    errors.extend(causes or [str(exc)])
+                    break
+                info["newton_iterations"] += iters
+                switched = [b.name for b in self.blocks.values() if b.check_active_set(net, x)]
+                for i, k in enumerate(names):
+                    s = self.streams[k]
+                    s.m, s.P = float(x[i]), float(x[n + i])
+                    s.locked = True
+                ctx.pressure_flow = True
+                dh = self._energy_pass(order, ctx)
+                if switched:
+                    continue
+                if iters == 0 and dh < max(10.0 * tolerance, 1e-8):
+                    converged = True
+                    break
+            else:
+                errors.append("The pressure–flow solution did not converge (the enthalpies kept changing).")
+            backwards = [k for i, k in enumerate(names) if x[i] < -1e-9 * m_ref]
+            if converged and backwards:
+                errors.append("Flow would run backwards in " + ", ".join(f"'{k}'" for k in backwards[:4])
+                              + ": the pressure downstream is higher than upstream. Add a check valve, or "
+                                "change the pressures.")
+            if final and not errors:
+                ctx.final = True
+                ctx.pressure_flow = True
+                for b in order:
+                    b.begin()
+                    try:
+                        b.calculate()
+                    except FAILURES as exc:
+                        b.error = str(exc)
+        finally:
+            for s in self.streams.values():
+                s.locked = False
+        for b in self.blocks.values():
+            if b.TYPE == "valve" and b.pf_state.get("wide_open"):
+                info["notes"].append(f"{b.name} is fully open")
+            if b.TYPE == "check_valve" and b.pf_state.get("closed"):
+                info["notes"].append(f"{b.name} is closed")
+        info["time_s"] = round(time.time() - t0, 3)
+        errors = errors + [f"{b.name}: {b.error}" for b in self.blocks.values() if b.error]
+        warnings = [f"{b.name}: {w}" for b in self.blocks.values() for w in b.warnings]
+        ok = converged and not errors
+        self.result = SolveResult(converged=ok, iterations=info["outer_iterations"],
+                                  max_change=0.0 if converged else float("inf"), errors=errors, warnings=warnings,
+                                  balance=self.balance() if ok else {}, network=info)
+        return self.result
+
+    def _pf_equations(self, net: Network) -> list[str]:
+        """Collect every block's equations; handle closed loops; check the structure."""
+        problems: list[str] = []
+        for b in self.blocks.values():
+            net.block = b.name
+            try:
+                b.hydraulics(net)
+            except NotImplementedError as exc:
+                problems.append(f"{b.name}: {exc}")
+            except FAILURES as exc:
+                problems.append(f"{b.name}: {exc}")
+        if problems:
+            return problems
+        loops = []
+        for blks, strs, grounded in components(self.blocks, self.streams):
+            if grounded:
+                continue
+            ms = {net.im(k) for k in strs}
+            ps = {net.ip(k) for k in strs}
+            desc = loop_description(blks, self.streams, strs)
+            loops.append((ms, desc))
+            # in a closed loop the mass balances add up to zero: one of them is redundant
+            redundant = [i for i, eq in enumerate(net.equations) if eq.mass and set(eq.vars) <= ms]
+            if redundant:
+                del net.equations[redundant[-1]]
+            if not any(eq.absolute_pressure and set(eq.vars) & ps for eq in net.equations):
+                problems.append(f"The closed loop {desc} has nothing to set its pressure level. Add a pressure "
+                                "reference: a supply set to 'Pressure reference (expansion tank)', joined to the "
+                                "loop through a mixer.")
+        if problems:
+            return problems
+        problems = net.structure()
+        for ms, desc in loops:
+            for i, msg in enumerate(problems):
+                if msg.startswith("Not enough") and any(f"'{net.names[j]}'" in msg for j in ms):
+                    problems[i] = (f"The closed loop {desc} has nothing to set its circulating flow: add a "
+                                   "Specification for one of its streams, or a pump curve with resistances. "
+                                   + msg)
+        return problems
+
+    def _energy_pass(self, order: list[Block], ctx: SolveContext, passes: int = 6) -> float:
+        """Forward passes with flows and pressures held at the network solution; returns the last change in h."""
+        change = float("inf")
+        for _ in range(passes):
+            before = {k: s.h for k, s in self.streams.items()}
+            for b in order:
+                b.begin()
+                try:
+                    b.calculate()
+                except FAILURES as exc:
+                    b.error = str(exc)
+            change = max((abs(s.h - before[k]) / (abs(s.h) + 10.0) for k, s in self.streams.items()
+                          if s.h is not None and before[k] is not None), default=0.0)
+            if change < 1e-11:
+                break
+        return change
+
     def _snapshot(self) -> dict[str, tuple]:
         return {n: (s.m, s.P, s.h, s.demand) for n, s in self.streams.items()}
 
@@ -405,7 +621,8 @@ class Flowsheet:
         return [s for s in self.streams.values() if self.blocks[s.source[0]].TYPE == "feed"]
 
     def products(self) -> list[Stream]:
-        return [s for s in self.streams.values() if s.dest is None]
+        return [s for s in self.streams.values()
+                if s.dest is None or self.blocks[s.dest[0]].TYPE == "sink"]
 
     def balance(self) -> dict[str, float]:
         """Overall mass and energy balance (kg/s and kW)."""
@@ -512,6 +729,7 @@ class Flowsheet:
             "blocks": [b.to_dict() for b in self.blocks.values()],
             "estimates": self.estimates,
             "layout": self.layout,
+            "solver_mode": self.solver_mode,
         }
 
     def to_json(self) -> str:
@@ -527,6 +745,10 @@ class Flowsheet:
             fs.add(BLOCK_TYPES[btype](bd["name"], bd.get("inlets"), bd.get("outlets"), bd.get("params")))
         fs.estimates = dict(data.get("estimates", {}))
         fs.layout = dict(data.get("layout") or {})
+        mode = data.get("solver_mode") or "sequential"
+        if mode not in SOLVER_MODES:
+            raise ValueError(f"Unknown solver mode '{mode}'.")
+        fs.solver_mode = mode
         return fs
 
     @classmethod

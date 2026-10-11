@@ -5,6 +5,7 @@ from __future__ import annotations
 from .flowsheet import Flowsheet
 from .flowsheet.blocks import (
     Boiler,
+    CheckValve,
     Condenser,
     Deaerator,
     Desuperheater,
@@ -12,13 +13,15 @@ from .flowsheet.blocks import (
     FlashVessel,
     Header,
     Mixer,
+    Heater,
     Pump,
+    Sink,
     Splitter,
     SteamUser,
     Turbine,
     Valve,
 )
-from .flowsheet.advanced import Adjust, HeatExchanger, Pipe, ReliefValveUnit
+from .flowsheet.advanced import Adjust, HeatExchanger, Pipe, ReliefValveUnit, Specification
 from .units import P_ATM_KPA
 
 
@@ -255,9 +258,133 @@ def empty() -> Flowsheet:
     return Flowsheet("New flowsheet", "")
 
 
+PD = {"mode": "Pressure-driven", "value": 0.0}
+TRAP = "Free pressure drop (steam trap / flow controller)"
+
+
+def cooling_water_network() -> Flowsheet:
+    """Pump on a curve feeding three parallel coolers; the flows split by hydraulics."""
+    fs = Flowsheet(
+        "Cooling-water network (pressure–flow)",
+        "A cooling-water pump draws from the tower basin and feeds three process coolers in parallel, each with "
+        "its own branch line and balancing valve; the water returns to the top of the tower. Solved in "
+        "pressure–flow mode: the pump runs where its curve meets the system's resistance, and the flow divides "
+        "between the branches until their pressure drops are equal. Try closing a balancing valve, or changing a "
+        "branch length, and watch the flows redistribute.",
+    )
+    fs.solver_mode = "pressure_flow"
+    fs.add(Feed("Tower basin", outlets={"out": "CW1"},
+                params={"pressure": P_ATM_KPA, "temperature": 30.0, "flow_mode": "As required", "flow": 40.0}))
+    fs.add(Pump("P-201", inlets={"in": "CW1"}, outlets={"out": "CW2"},
+                params={"mode": "Pump curve", "shutoff_head": 48.0, "rated_flow": 150.0, "rated_head": 38.0,
+                        "efficiency": 78.0, "npshr": 4.0, "suction_head": 2.0}))
+    fs.add(Pipe("L-201 CW supply header", inlets={"in": "CW2"}, outlets={"out": "CW3"},
+                params={"nps": "6", "length": 120.0, "elevation": 6.0,
+                        "fittings": {"elbow_90_lr": 4, "gate": 2, "check_swing": 1}}))
+    fs.add(Splitter("Supply manifold", inlets={"in": "CW3"}, outlets={"out": ["CW-A1", "CW-B1", "CW-C1"]},
+                    params={"outlet_specs": {"CW-A1": PD, "CW-B1": PD, "CW-C1": PD}}))
+    branches = (("A", 40.0, 800.0, 60.0), ("B", 70.0, 600.0, 80.0), ("C", 110.0, 1000.0, 100.0))
+    returns = []
+    for tag, length, duty, opening in branches:
+        fs.add(Pipe(f"L-20{ord(tag) - 63} branch {tag}", inlets={"in": f"CW-{tag}1"}, outlets={"out": f"CW-{tag}2"},
+                    params={"nps": "3", "length": length, "fittings": {"elbow_90_std": 4, "gate": 2, "tee_branch": 1}}))
+        fs.add(Heater(f"E-20{ord(tag) - 64} cooler {tag}", inlets={"in": f"CW-{tag}2"}, outlets={"out": f"CW-{tag}3"},
+                      params={"spec": "Heat duty", "duty": duty, "dp_mode": "Scales with flow²",
+                              "pressure_drop": 50.0, "rated_flow": 12.0}))
+        fs.add(Valve(f"HV-20{ord(tag) - 64}", inlets={"in": f"CW-{tag}3"}, outlets={"out": f"CW-{tag}4"},
+                     params={"mode": "Cv and opening", "cv": 60.0, "opening": opening, "characteristic": "Linear"}))
+        returns.append(f"CW-{tag}4")
+    fs.add(Mixer("Return manifold", inlets={"in": returns}, outlets={"out": "CW4"},
+                 params={"pressure_mode": "Equal pressures (junction)"}))
+    fs.add(Pipe("L-205 CW return", inlets={"in": "CW4"}, outlets={"out": "CW5"},
+                params={"nps": "6", "length": 150.0, "elevation": 8.0, "fittings": {"elbow_90_lr": 5, "gate": 1}}))
+    fs.add(Sink("Tower distribution", inlets={"in": "CW5"}, params={"pressure": P_ATM_KPA}))
+    return fs
+
+
+def condensate_return_network() -> Flowsheet:
+    """Three steam users with traps discharging into a common lifted return line."""
+    fs = Flowsheet(
+        "Condensate return with trap back pressure (pressure–flow)",
+        "Three process heaters on a 7 bar(g) steam main drain through steam traps into a common condensate return "
+        "that rises 5 m to a vented receiver. Solved in pressure–flow mode: the traps pass whatever condensate "
+        "forms, and the back pressure at each trap is worked out backwards from the receiver, through the flashing "
+        "two-phase return line. Each trap's results show its back pressure, which must stay below its inlet "
+        "pressure.",
+    )
+    fs.solver_mode = "pressure_flow"
+    fs.add(Feed("Steam main", outlets={"out": "ST1"},
+                params={"pressure": barg(7), "condition": "Dryness fraction", "dryness": 1.0,
+                        "flow_mode": "As required", "flow": 1.0}))
+    fs.add(Splitter("Steam branches", inlets={"in": "ST1"}, outlets={"out": ["ST-A", "ST-B", "ST-C"]},
+                    params={"outlet_specs": {"ST-A": PD, "ST-B": PD, "ST-C": PD}}))
+    users = (("A", 900.0, 30.0), ("B", 600.0, 45.0), ("C", 1200.0, 20.0))
+    drains = []
+    for tag, duty, length in users:
+        fs.add(SteamUser(f"Heater {tag}", inlets={"in": f"ST-{tag}"}, outlets={"condensate": f"CD-{tag}1"},
+                         params={"spec": "Heat duty", "duty": duty}))
+        fs.add(Valve(f"ST-10{ord(tag) - 64} trap", inlets={"in": f"CD-{tag}1"}, outlets={"out": f"CD-{tag}2"},
+                     params={"mode": TRAP, "outlet_pressure": barg(1)}))
+        fs.add(Pipe(f"L-30{ord(tag) - 64} drain {tag}", inlets={"in": f"CD-{tag}2"}, outlets={"out": f"CD-{tag}3"},
+                    params={"nps": "2", "length": length, "fittings": {"elbow_90_std": 3, "tee_branch": 1},
+                            "void_model": "Drift flux (Rouhani–Axelsson)"}))
+        drains.append(f"CD-{tag}3")
+    fs.add(Mixer("Return header", inlets={"in": drains}, outlets={"out": "CD1"},
+                 params={"pressure_mode": "Equal pressures (junction)"}))
+    fs.add(Pipe("L-304 condensate return", inlets={"in": "CD1"}, outlets={"out": "CD2"},
+                params={"nps": "4", "length": 150.0, "elevation": 5.0, "fittings": {"elbow_90_lr": 6, "gate": 1},
+                        "void_model": "Drift flux (Rouhani–Axelsson)"}))
+    fs.add(FlashVessel("Condensate receiver", inlets={"in": "CD2"}, outlets={"vapour": "Flash to vent",
+                                                                           "liquid": "Receiver outlet"},
+                       params={"pressure": barg(0.1), "inlet_specs": {"CD2": "Open"}}))
+    return fs
+
+
+def closed_heating_loop() -> Flowsheet:
+    """A closed hot-water loop: the expansion tank only sets the pressure."""
+    fs = Flowsheet(
+        "Closed hot-water heating loop (pressure–flow)",
+        "A closed low-temperature hot-water loop: a circulating pump, a boiler heat exchanger raising the water to "
+        "80 °C, and two heating circuits in parallel. The expansion tank sets the loop's pressure; its flow settles "
+        "at zero. The circulating flow and the split between the circuits follow from the pump curve and the "
+        "resistances, and the return temperature from the heat taken by each circuit.",
+    )
+    fs.solver_mode = "pressure_flow"
+    fs.add(Feed("Expansion tank", outlets={"out": "X"},
+                params={"pressure": barg(1.5), "temperature": 60.0,
+                        "flow_mode": "Pressure reference (expansion tank)", "flow": 0.0}))
+    fs.add(Mixer("Pump suction", inlets={"in": ["HW-R2", "X"]}, outlets={"out": "HW1"},
+                 params={"pressure_mode": "Equal pressures (junction)"}))
+    fs.add(Pump("P-401", inlets={"in": "HW1"}, outlets={"out": "HW2"},
+                params={"mode": "Pump curve", "shutoff_head": 22.0, "rated_flow": 40.0, "rated_head": 16.0,
+                        "efficiency": 70.0}))
+    fs.add(Heater("E-401 boiler heat exchanger", inlets={"in": "HW2"}, outlets={"out": "HW3"},
+                  params={"spec": "Outlet temperature", "temperature": 80.0, "dp_mode": "Scales with flow²",
+                          "pressure_drop": 30.0, "rated_flow": 11.0}))
+    fs.add(Pipe("L-401 flow main", inlets={"in": "HW3"}, outlets={"out": "HW4"},
+                params={"nps": "4", "length": 80.0, "fittings": {"elbow_90_lr": 6, "gate": 2},
+                        "heat_loss": "Insulated", "ambient": 15.0}))
+    fs.add(Splitter("Flow manifold", inlets={"in": "HW4"}, outlets={"out": ["HW-A1", "HW-B1"]},
+                    params={"outlet_specs": {"HW-A1": PD, "HW-B1": PD}}))
+    for tag, length, duty in (("A", 60.0, -250.0), ("B", 120.0, -350.0)):
+        fs.add(Pipe(f"L-40{ord(tag) - 63} circuit {tag}", inlets={"in": f"HW-{tag}1"}, outlets={"out": f"HW-{tag}2"},
+                    params={"nps": "2-1/2", "length": length, "fittings": {"elbow_90_std": 8, "gate": 2}}))
+        fs.add(Heater(f"Heating circuit {tag}", inlets={"in": f"HW-{tag}2"}, outlets={"out": f"HW-{tag}3"},
+                      params={"spec": "Heat duty", "duty": duty, "dp_mode": "Scales with flow²",
+                              "pressure_drop": 20.0, "rated_flow": 5.0}))
+    fs.add(Mixer("Return manifold", inlets={"in": ["HW-A3", "HW-B3"]}, outlets={"out": "HW-R1"},
+                 params={"pressure_mode": "Equal pressures (junction)"}))
+    fs.add(Pipe("L-404 return main", inlets={"in": "HW-R1"}, outlets={"out": "HW-R2"},
+                params={"nps": "4", "length": 80.0, "fittings": {"elbow_90_lr": 6, "gate": 2}}))
+    return fs
+
+
 EXAMPLES = {
     "Steam distribution with pipes and relief valves": steam_distribution,
     "Industrial steam system": industrial_steam_system,
+    "Cooling-water network (pressure–flow)": cooling_water_network,
+    "Condensate return with trap back pressure (pressure–flow)": condensate_return_network,
+    "Closed hot-water heating loop (pressure–flow)": closed_heating_loop,
     "Rankine cycle with closed feedwater heater": rankine_closed_fwh,
     "Simple Rankine cycle (textbook)": simple_rankine,
     "Regenerative Rankine cycle (textbook)": regenerative_rankine,

@@ -26,7 +26,8 @@ class Param:
       'stream_choice' / 'block_choice' (any stream / equipment in the flowsheet),
       'param_choice' / 'result_choice' (a setting / result of the equipment chosen in
       the setting named by depends_on), 'fittings' ({fitting: count}),
-      'target_value' (number whose unit follows the chosen target property)
+      'target_value' (number whose unit follows the chosen target property),
+      'scenarios' (list of relief scenarios)
     """
 
     key: str
@@ -51,9 +52,11 @@ class Port:
     optional: bool = False
     help: str = ""
     with_specs: bool = False  # outlet flow specifications (splitter, header)
+    open_option: bool = False  # inlet can be 'Open' (arrives at the vessel pressure) in pressure–flow mode
 
 
-FLOW_MODES = ("Flow", "Fraction", "As required", "Remainder")
+FLOW_MODES = ("Flow", "Fraction", "As required", "Remainder", "Pressure-driven")
+INLET_MODES = ("Throttled", "Open")
 
 
 @dataclass
@@ -75,12 +78,16 @@ class Stream:
         self.source: tuple[str, str] | None = None  # (block name, port)
         self.dest: tuple[str, str] | None = None
         self.estimate: dict | None = None
+        self.locked = False  # pressure–flow mode: m and P come from the network solution
 
     @property
     def known(self) -> bool:
         return self.m is not None and self.P is not None and self.h is not None
 
     def set(self, m: float, P: float, h: float) -> None:
+        if self.locked:  # flow and pressure were fixed by the pressure–flow solution
+            self.h = float(h)
+            return
         self.m, self.P, self.h = float(m), float(P), float(h)
 
     @property
@@ -94,10 +101,12 @@ class Stream:
 class SolveContext:
     """Gives equipment access to its streams (and the other equipment) during a solve."""
 
-    def __init__(self, streams: dict[str, Stream], final: bool = False, blocks: dict | None = None):
+    def __init__(self, streams: dict[str, Stream], final: bool = False, blocks: dict | None = None,
+                 pressure_flow: bool = False):
         self.streams = streams
         self.final = final
         self.blocks = blocks or {}
+        self.pressure_flow = pressure_flow  # flows and pressures come from the network solution
 
 
 # stream properties that Adjust and case studies can target: name -> (kind, getter)
@@ -146,12 +155,15 @@ class Block:
         self.outlets: dict[str, Any] = dict(outlets or {})
         self.params: dict[str, Any] = {p.key: copy.deepcopy(p.default) for p in self.PARAMS}
         if params:
-            unknown = set(params) - set(self.params) - {"outlet_specs"}
+            unknown = set(params) - set(self.params) - {"outlet_specs", "inlet_specs"}
             if unknown:
                 raise ValueError(f"{self.LABEL} '{name}': unknown setting(s) {sorted(unknown)}")
             self.params.update(copy.deepcopy(params))
         if any(p.with_specs for p in self.OUTLETS):
             self.params.setdefault("outlet_specs", {})
+        if any(p.open_option for p in self.INLETS):
+            self.params.setdefault("inlet_specs", {})
+        self.pf_state: dict[str, Any] = {}  # pressure–flow active sets (kept between passes)
         self.results: dict[str, Result] = {}
         self.steps: list[Step] = []
         self.warnings: list[str] = []
@@ -225,6 +237,27 @@ class Block:
     def update_demands(self) -> None:
         """Default: no flow requests."""
 
+    def hydraulics(self, net) -> None:
+        """Add this equipment's pressure–flow equations to the network (see network.py)."""
+        raise NotImplementedError(f"{self.LABEL} cannot be used in pressure–flow mode yet.")
+
+    def diagnose(self, net, x) -> str | None:
+        """Pressure–flow mode: explain why this equipment may make the equations unsolvable at x."""
+        return None
+
+    def check_active_set(self, net, x) -> bool:
+        """Pressure–flow mode: switch between alternative equation sets (e.g. a PRV that runs wide open).
+        Return True if the set changed."""
+        return False
+
+    @property
+    def pf(self) -> bool:
+        """True during the energy pass of a pressure–flow solve (flows and pressures are imposed)."""
+        return bool(self._ctx is not None and self._ctx.pressure_flow)
+
+    def inlet_open(self, stream_name: str) -> bool:
+        return (self.params.get("inlet_specs") or {}).get(stream_name) == "Open"
+
     def initial_guess(self, port: str) -> tuple[float, float, float] | None:
         """(P, h, m) starting estimate for an outlet, or None."""
         return None
@@ -294,7 +327,7 @@ def allocate_outlets(block: Block, m_total: float, outlets: list[Stream]) -> dic
             flows[s.name] = max(val, 0.0)
         elif mode == "Fraction":
             flows[s.name] = max(val, 0.0) / 100.0 * m_total
-        elif mode == "As required":
+        elif mode in ("As required", "Pressure-driven"):
             flows[s.name] = max(s.demand or 0.0, 0.0)
         elif mode == "Remainder":
             if remainder is not None:
@@ -348,9 +381,7 @@ def requested_outflow(block: Block, outlets: list[Stream], m_total_guess: float)
         mode = spec.get("mode", "Remainder")
         if mode == "Flow":
             total += max(float(spec.get("value") or 0.0), 0.0)
-        elif mode == "As required":
-            total += max(s.demand or 0.0, 0.0)
-        elif mode == "Remainder":
+        elif mode in ("As required", "Pressure-driven", "Remainder"):
             total += max(s.demand or 0.0, 0.0)
         elif mode == "Fraction":
             return None

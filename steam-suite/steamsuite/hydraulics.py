@@ -32,6 +32,7 @@ from .water import (
     state_Ps,
     state_PT,
     state_Px,
+    sat_transport,
     surface_tension,
 )
 
@@ -251,23 +252,29 @@ def void_fraction(st: WaterState, G: float, model: str = "Homogeneous", sin_thet
     if st.phase != "two-phase":
         return 1.0 if st.is_vapour_like else 0.0
     x = st.x
-    liq, vap = state_Px(st.P, 0.0), state_Px(st.P, 1.0)
-    a = x / vap.rho
-    b = (1.0 - x) / liq.rho
+    rf, rg, _, _ = sat_transport(st.P)
+    a = x / rg
+    b = (1.0 - x) / rf
     if not model.startswith("Drift") or sin_theta < -0.05 or G <= 0:
         return a / (a + b)
     c0 = 1.0 + (0.12 + 0.08 * min(max(sin_theta, 0.0), 1.0)) * (1.0 - x)
     sigma = surface_tension(st.T)
-    ugj = 1.18 * (1.0 - x) * (G_ACC * sigma * max(liq.rho - vap.rho, 0.0)) ** 0.25 / math.sqrt(liq.rho)
+    ugj = 1.18 * (1.0 - x) * (G_ACC * sigma * max(rf - rg, 0.0)) ** 0.25 / math.sqrt(rf)
     return a / (c0 * (a + b) + ugj / G)
 
 
-def _props(st: WaterState) -> tuple[float, float, WaterState | None, WaterState | None]:
+@dataclass(frozen=True)
+class _Phase:
+    rho: float
+    mu: float
+
+
+def _props(st: WaterState) -> tuple[float, float, _Phase | None, _Phase | None]:
     """(density, viscosity, saturated liquid, saturated vapour) for friction calculations."""
     if st.phase == "two-phase":
-        liq, vap = state_Px(st.P, 0.0), state_Px(st.P, 1.0)
-        mu = st.x * vap.mu + (1.0 - st.x) * liq.mu  # Cicchitti mixture viscosity
-        return st.rho, mu, liq, vap
+        rf, rg, mf, mg = sat_transport(st.P)
+        mu = st.x * mg + (1.0 - st.x) * mf  # Cicchitti mixture viscosity
+        return st.rho, mu, _Phase(rf, mf), _Phase(rg, mg)
     mu = st.mu
     if mu is None:  # saturated state built from (P, h) at x = 0 or 1
         sat = state_Px(st.P, 1.0 if st.is_vapour_like else 0.0)
@@ -275,8 +282,7 @@ def _props(st: WaterState) -> tuple[float, float, WaterState | None, WaterState 
     return st.rho, mu, None, None
 
 
-def _two_phase_friction(x: float, T: float, G: float, d: float, eps: float, liq: WaterState, vap: WaterState,
-                        method: str) -> float:
+def _two_phase_friction(x: float, T: float, G: float, d: float, eps: float, liq, vap, method: str) -> float:
     """Two-phase frictional pressure gradient, Pa/m."""
     rl, rg, ml, mg = liq.rho, vap.rho, liq.mu, vap.mu
     rho_h = 1.0 / (x / rg + (1.0 - x) / rl)
@@ -308,6 +314,14 @@ def _two_phase_friction(x: float, T: float, G: float, d: float, eps: float, liq:
     # Müller-Steinhagen & Heck (default)
     lam = a + 2.0 * (b - a) * x
     return lam * (1.0 - x) ** (1.0 / 3.0) + b * x**3
+
+
+def _friction(st: WaterState, G: float, d: float, eps: float, method: str, tp_factor: float = 1.0) -> tuple[float, float]:
+    """(frictional pressure gradient Pa/m, density for fittings losses): the part of _gradients a march needs."""
+    rho, mu, liq, vap = _props(st)
+    if liq is None:
+        return friction_factor(G * d / mu, eps / d) * G * G / (2.0 * d * rho), rho
+    return _two_phase_friction(st.x, st.T, G, d, eps, liq, vap, method) * tp_factor, rho
 
 
 def _gradients(st: WaterState, G: float, d: float, eps: float, method: str,
@@ -362,17 +376,17 @@ class _Pipe:
         momentum-flux specific volume, heat loss W/m) at a state."""
         G = self.G
         if G > 0:
-            grad, rho_k, _, _ = _gradients(st, G, self.d, self.eps, self.method, self.tp_factor)
+            grad, rho_k = _friction(st, G, self.d, self.eps, self.method, self.tp_factor)
         else:
             grad, rho_k = 0.0, st.rho
         rho_s, u_mom = st.rho, 1.0 / st.rho
         if st.phase == "two-phase" and self.void_model.startswith("Drift"):
             alpha = void_fraction(st, G, self.void_model, self.sin_theta)
-            liq, vap = state_Px(st.P, 0.0), state_Px(st.P, 1.0)
-            rho_s = alpha * vap.rho + (1.0 - alpha) * liq.rho
+            rf, rg, _, _ = sat_transport(st.P)
+            rho_s = alpha * rg + (1.0 - alpha) * rf
             x = st.x
-            u_mom = ((x * x / (alpha * vap.rho) if alpha > 0 else 0.0)
-                     + ((1.0 - x) ** 2 / ((1.0 - alpha) * liq.rho) if alpha < 1 else 0.0))
+            u_mom = ((x * x / (alpha * rg) if alpha > 0 else 0.0)
+                     + ((1.0 - x) ** 2 / ((1.0 - alpha) * rf) if alpha < 1 else 0.0))
         q = 0.0
         if self.heat is not None:
             ht = self.heat
@@ -511,8 +525,13 @@ def _march(pipe: _Pipe, st0: WaterState, n: int) -> PipeResult:
             h_end = h - dh_q - G_ACC * dzs / 1000.0
             too_low(P_end)
             st_end = state_Ph(P_end, h_end)
-            # two trapezoidal corrector passes
-            for _ in range(2):
+            # trapezoidal corrector passes, repeated until the outlet pressure settles (two are enough at
+            # low Mach number; the acceleration term needs more as the velocity approaches the speed of sound)
+            P_prev = None
+            for k in range(12):
+                if k >= 2 and abs(P_end - P_prev) <= 1e-10 * P:
+                    break
+                P_prev = P_end
                 g2, r2k, r2s, u2, q2 = pipe.rates(st_end)
                 dp_f = 0.5 * (g1 + g2) * dl / 1000.0
                 dp_k = dk * G * G / (2.0 * 0.5 * (r1k + r2k)) / 1000.0
@@ -593,7 +612,7 @@ def _pressure_march(pipe: _Pipe, st: WaterState, P: float, h: float, L_done: flo
         q2 = q1
         h2 = h
         st2 = None
-        for _ in range(3):
+        for _ in range(iterate):
             H2 = H - G_ACC * sin_t * dL / 1000.0 - (0.5 * (q1 + q2) * dL / 1000.0 / m)
             h2 = _energy_state(P2, H2, h2, G)
             st2 = state_Ph(P2, h2)
@@ -607,8 +626,11 @@ def _pressure_march(pipe: _Pipe, st: WaterState, P: float, h: float, L_done: flo
         return st2, h2, dL, (F1, F2, K1, K2, rs1, rs2, u1, u2, q1, q2)
 
     dL_prev = 0.0
+    mach = tot.mach
+    iterate = 3 if (sin_t != 0.0 or pipe.heat is not None) else 1  # dL only feeds back through elevation and heat
     for _ in range(4000):
-        P2 = P * (1.0 - 0.004)
+        # pressure steps: 0.4 % near choking, up to 1.2 % where the Mach number is lower
+        P2 = P * (1.0 - 0.004 * min(max((0.6 / max(mach, 1e-6)) ** 2, 1.0), 3.0))
         if P2 < p_floor:
             raise ValueError("The pressure falls to almost nothing along the pipe: the pipe is far too small for "
                              "this flow (or too long). Increase the pipe size.")
@@ -632,6 +654,7 @@ def _pressure_march(pipe: _Pipe, st: WaterState, P: float, h: float, L_done: flo
             return _finish(pipe, tot, P_end, h_e, st_e, v_in, re_in, f_in)
         _add_step(tot, pipe, parts, P, P2, dL, L_done + dL, st2)
         tot.mach = max(tot.mach, mach2)
+        mach = mach2
         L_done += dL
         L_left -= dL
         P, h, st = P2, h2, st2
