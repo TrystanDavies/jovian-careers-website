@@ -134,6 +134,25 @@ def case_study(data: dict = Body(...)) -> dict:
     return serialize.clean({"rows": rows})
 
 
+@app.post("/api/relief-system")
+def relief_system(data: dict = Body(...)) -> dict:
+    """{valve: ReliefInput fields, scenarios: [...], inlet: LineSpec | null, outlet: LineSpec | null,
+    outlet_to: 'atmosphere' | 'header', superimposed_kpag}"""
+    from ..relief_system import LineSpec, size_relief_system
+    try:
+        base = ReliefInput(**(data.get("valve") or {}))
+        inlet = LineSpec(**data["inlet"]) if data.get("inlet") else None
+        outlet = LineSpec(**data["outlet"]) if data.get("outlet") else None
+        res = size_relief_system(base, data.get("scenarios") or None, inlet, outlet,
+                                 data.get("outlet_to") or "atmosphere", float(data.get("superimposed_kpag") or 0.0))
+    except (TypeError, ValueError, KeyError, WaterPropertyError) as exc:
+        raise _bad(exc) from exc
+    payload = serialize.relief_system_payload(res)
+    payload["html"] = res.report.to_html()
+    payload["markdown"] = res.report.to_markdown()
+    return payload
+
+
 @app.post("/api/relief")
 def relief(data: dict = Body(...)) -> dict:
     try:

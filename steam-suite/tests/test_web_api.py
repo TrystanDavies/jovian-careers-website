@@ -104,3 +104,18 @@ def test_pressure_flow_solve_reports_the_network_and_accepts_a_warm_start():
     cat = client.get("/api/catalog").json()
     assert "pressure_flow" in cat["solver_modes"] and "Open" in cat["inlet_modes"]
     assert {"sink", "check_valve", "specification"} <= {b["type"] for b in cat["blocks"]}
+
+
+def test_relief_system_endpoint():
+    cat = client.get("/api/catalog").json()
+    assert {"fire", "cv_failure", "tube_rupture", "thermal"} <= set(cat["scenarios"])
+    body = {"valve": {"fluid": "saturated_steam", "flow_kg_h": 1.0, "set_pressure_kpag": 1000.0, "tag": "PSV-9"},
+            "scenarios": [{"type": "fire", "wetted_area": 30.0}, {"type": "given", "flow": 1.0}],
+            "inlet": {"nps": "4", "length": 1.0, "fittings": {"entrance_sharp": 1}},
+            "outlet": {"nps": "6", "length": 8.0}, "outlet_to": "atmosphere"}
+    r = client.post("/api/relief-system", json=body)
+    assert r.status_code == 200, r.text
+    j = r.json()
+    assert j["orifice"] and j["governing"] and len(j["scenarios"]) == 2
+    assert j["reaction"]["force_n"] > 0 and "Relief scenarios" in j["html"]
+    assert client.post("/api/relief-system", json={"valve": {"fluid": "x"}}).status_code == 400

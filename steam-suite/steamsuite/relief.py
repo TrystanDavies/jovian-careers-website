@@ -825,10 +825,11 @@ def _coeff_step(rep, inp, kd, kb, kc, regime, kw=None, kd_text=None):
 
 def _assumptions(inp: ReliefInput) -> list[str]:
     items = [
-        "The required relieving rate is an input. Determine it from the governing overpressure scenario "
-        "(e.g. blocked outlet, control valve failure, fire, tube rupture) per API 521.",
-        "Inlet pipe pressure loss is not included. Keep it below 3 % of set pressure (API 520 Part II), "
-        "and check the discharge piping and reaction forces.",
+        "The required relieving rate is an input here. The relief scenarios (API 521: fire, control valve "
+        "failure, blocked outlet, tube rupture, ...) can work it out, and size the valve for the governing case.",
+        "Inlet pressure loss, built-up back pressure and reaction force are checked when the inlet and "
+        "discharge lines are given; otherwise keep the inlet loss below 3 % of set pressure (API 520 Part II) "
+        "and check the discharge piping separately.",
         "Fluid properties are from IAPWS-IF97. Direct integration assumes isentropic, homogeneous-equilibrium "
         "flow through an ideal nozzle, corrected by the discharge coefficient.",
     ]

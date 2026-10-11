@@ -35,12 +35,7 @@ def catalog() -> dict:
             "description": cls.DESCRIPTION,
             "inlets": [asdict(p) for p in cls.INLETS],
             "outlets": [asdict(p) for p in cls.OUTLETS],
-            "params": [{
-                "key": p.key, "label": p.label, "kind": p.kind, "default": p.default, "help": p.help,
-                "choices": list(p.choices), "show_if": [p.show_if[0], list(p.show_if[1])] if p.show_if else None,
-                "min": p.min_value, "max": p.max_value, "inlet_port": p.inlet_port, "group": p.group,
-                "depends_on": p.depends_on,
-            } for p in cls.PARAMS],
+            "params": [param_dict(p) for p in cls.PARAMS],
         })
     return clean({
         "blocks": blocks,
@@ -60,8 +55,25 @@ def catalog() -> dict:
                              for k, b in OVERPRESSURE_BASES.items()},
         },
         "orifices": [list(o) for o in API526_ORIFICES],
+        "scenarios": scenario_catalog(),
         "property_backend": BACKEND,
     })
+
+
+def param_dict(p) -> dict:
+    return {
+        "key": p.key, "label": p.label, "kind": p.kind, "default": p.default, "help": p.help,
+        "choices": list(p.choices), "show_if": [p.show_if[0], list(p.show_if[1])] if p.show_if else None,
+        "min": p.min_value, "max": p.max_value, "inlet_port": p.inlet_port, "group": p.group,
+        "depends_on": p.depends_on,
+    }
+
+
+def scenario_catalog() -> dict:
+    from ..scenarios import SCENARIO_TYPES
+    return {k: {"label": t.label, "description": t.description, "params": [param_dict(p) for p in t.params],
+                "block_param": t.block_param, "block_types": list(t.block_types)}
+            for k, t in SCENARIO_TYPES.items()}
 
 
 def state_dict(st: WaterState) -> dict:
@@ -144,3 +156,39 @@ def relief_payload(res: ReliefResult) -> dict:
                    "choked": res.nozzle.choked, "curve": res.nozzle.curve} if res.nozzle else None,
         "report": report_dict(res.report),
     })
+
+
+def relief_system_payload(res) -> dict:
+    """JSON for a relief valve sized for several scenarios with its piping."""
+    rows = []
+    for z in res.sizings:
+        sc = z.scenario
+        row = {"title": sc.title, "type": sc.key, "applies": sc.applies, "rate_kg_h": sc.rate_kg_h,
+               "fluid": sc.fluid, "fluid_text": sc.describe_fluid(), "error": z.error, "note": sc.note,
+               "governs": z is res.governing, "steps": [step_dict(s) for s in sc.steps]}
+        if z.relief is not None:
+            row.update({"area_mm2": z.relief.required_area_mm2, "relieving_pressure_kpa": z.relief.relieving_pressure_kpa,
+                        "rated_kg_h": z.rated_kg_h, "back_pressure_kpag": z.back_pressure_kpag,
+                        "method": z.relief.governing_method, "regime": z.relief.flow_regime})
+        if z.inlet is not None:
+            row["inlet"] = {"percent": z.inlet.percent, "ok": z.inlet.ok, "dp": z.inlet.dp_nonrecoverable,
+                            "velocity": z.inlet.velocity}
+        if z.discharge is not None:
+            d = z.discharge
+            row["discharge"] = {"built_up": d.built_up, "P_outlet": d.P_outlet, "P_exit": d.P_exit,
+                                "v_exit": d.v_exit, "choked": d.choked_exit}
+        rows.append(row)
+    gov = res.governing
+    out = {
+        "scenarios": rows,
+        "orifice": res.orifice,
+        "orifice_area_mm2": res.orifice_area_mm2,
+        "valves_needed": res.valves_needed,
+        "governing": gov.scenario.title if gov else None,
+        "warnings": res.warnings,
+        "reaction": {"force_n": res.reaction.force_n, "api_force_n": res.reaction.api_force_n} if res.reaction else None,
+        "report": report_dict(res.report),
+    }
+    if gov is not None and gov.relief is not None:
+        out["relief"] = relief_payload(gov.relief)
+    return clean(out)

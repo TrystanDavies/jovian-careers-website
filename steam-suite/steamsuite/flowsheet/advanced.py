@@ -606,13 +606,34 @@ class HeatExchanger(Block):
 # --- relief valve on the drawing -----------------------------------------------------------------
 
 
+LINE_FITTINGS_IN = {"entrance_sharp": 1}
+LINE_FITTINGS_OUT = {"elbow_90_lr": 1, "exit": 1}
+OUTLET_LINES = ("None (enter the back pressure)", "Pipe to atmosphere", "Pipe to a header")
+RATE_MODES = ("Stream flow × factor", "Fixed rate", "Scenarios (API 521)")
+
+
+def _line_params(prefix: str, group: str, fittings: dict, show: tuple) -> list[Param]:
+    sw = (f"{prefix}_line", show)
+    return [
+        Param(f"{prefix}_nps", "Nominal pipe size (inch)", "choice", "3", choices=tuple(PIPE_SIZES), show_if=sw,
+              group=group),
+        Param(f"{prefix}_schedule", "Schedule", "choice", "40", choices=SCHEDULES, show_if=sw, group=group),
+        Param(f"{prefix}_length", "Length", "length", 1.0 if prefix == "inlet" else 6.0, min_value=0.0, show_if=sw,
+              group=group),
+        Param(f"{prefix}_elevation", "Rise (outlet above inlet)", "length", 0.0, show_if=sw, group=group),
+        Param(f"{prefix}_fittings", "Fittings", "fittings", dict(fittings), show_if=sw, group=group),
+    ]
+
+
 @register
 class ReliefValveUnit(Block):
     TYPE = "relief_valve"
     LABEL = "Pressure relief valve (PSV)"
     CATEGORY = "Safety"
-    DESCRIPTION = ("Sizes a pressure relief valve to API 520 from the conditions of the stream it protects. "
-                   "It does not take part in the heat and mass balance (it is closed in normal operation).")
+    DESCRIPTION = ("Sizes a pressure relief valve to API 520 from the conditions of the stream it protects, or for "
+                   "a set of API 521 relief scenarios, and checks its inlet line (3 % rule), the back pressure "
+                   "built up in its discharge line and the reaction force. It does not take part in the heat and "
+                   "mass balance (it is closed in normal operation).")
     INLETS = []
     OUTLETS = []
     PARAMS = [
@@ -623,43 +644,48 @@ class ReliefValveUnit(Block):
               choices=tuple(b.label for b in OVERPRESSURE_BASES.values())),
         Param("custom_op", "Custom overpressure", "percent", 10.0, min_value=0.1,
               show_if=("overpressure", (OVERPRESSURE_BASES["custom"].label,))),
-        Param("rate_mode", "Relieving rate", "choice", "Stream flow × factor", choices=("Stream flow × factor", "Fixed rate")),
+        Param("rate_mode", "Relieving rate", "choice", "Stream flow × factor", choices=RATE_MODES,
+              help="Scenarios: work out the rate for each API 521 case (fire, control valve failure, blocked "
+                   "outlet, tube rupture, ...); the case needing the largest orifice governs."),
         Param("rate_factor", "Factor on the stream flow", "number", 1.0, min_value=0.0,
               show_if=("rate_mode", ("Stream flow × factor",))),
         Param("rate", "Relieving rate", "mass_flow", 1.0, min_value=0.0, show_if=("rate_mode", ("Fixed rate",))),
-        Param("valve_type", "Valve type", "choice", VALVE_TYPES["conventional"], choices=tuple(VALVE_TYPES.values())),
-        Param("back_pressure", "Total back pressure (gauge)", "pressure_diff", 0.0),
-        Param("rupture_disk", "Rupture disk upstream", "choice", "No", choices=("No", "Yes")),
+        Param("scenarios", "Relief scenarios", "scenarios", [], show_if=("rate_mode", ("Scenarios (API 521)",)),
+              group="Relief scenarios"),
+        Param("valve_type", "Valve type", "choice", VALVE_TYPES["conventional"], choices=tuple(VALVE_TYPES.values()),
+              group="Valve"),
+        Param("rupture_disk", "Rupture disk upstream", "choice", "No", choices=("No", "Yes"), group="Valve"),
         Param("kb", "Back pressure factor Kb (from the manufacturer)", "number", 1.0, min_value=0.05, max_value=1.0,
-              show_if=("valve_type", (VALVE_TYPES["balanced"],))),
+              show_if=("valve_type", (VALVE_TYPES["balanced"],)), group="Valve"),
+        Param("inlet_line", "Inlet line", "choice", "None", choices=("None", "Pipe"), group="Inlet line",
+              help="Checks the pressure loss from the protected equipment to the valve against 3 % of the set "
+                   "pressure (API 520 Part II)."),
+        *_line_params("inlet", "Inlet line", LINE_FITTINGS_IN, ("Pipe",)),
+        Param("outlet_line", "Discharge", "choice", OUTLET_LINES[0], choices=OUTLET_LINES, group="Discharge line",
+              help="With a discharge pipe the built-up back pressure is calculated (and the reaction force for an "
+                   "open discharge)."),
+        Param("back_pressure", "Total back pressure (gauge)", "pressure_diff", 0.0, group="Discharge line",
+              show_if=("outlet_line", (OUTLET_LINES[0],))),
+        Param("superimposed", "Header pressure (superimposed back pressure, gauge)", "pressure_diff", 0.0,
+              group="Discharge line", show_if=("outlet_line", ("Pipe to a header",))),
+        *_line_params("outlet", "Discharge line", LINE_FITTINGS_OUT, OUTLET_LINES[1:]),
     ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.relief = None
+        self.system = None
 
     def hydraulics(self, net):
         """Closed in normal operation: no flow equations."""
 
-    def calculate(self):
-        if not self._ctx.final:
-            return
-        name = self.p("stream")
-        if not name:
-            raise ValueError("Choose the stream this relief valve protects.")
-        s = self._ctx.streams.get(name)
-        if s is None or not s.known:
-            raise ValueError(f"Stream '{name}' does not exist or has not been calculated.")
-        st = s.state
-        set_g = self.p("set_pressure") - P_ATM_KPA
-        if self.p("set_pressure") <= s.P:
-            self.warn(f"The set pressure is not above the operating pressure of '{name}' "
-                      f"({fmt(s.P - P_ATM_KPA)} kPa(g)): the valve would be open in normal operation.")
-        basis = next(k for k, b in OVERPRESSURE_BASES.items() if b.label == self.p("overpressure"))
-        _, dp_op, _ = _overpressure(ReliefInput(fluid="saturated_steam", flow_kg_h=1.0, set_pressure_kpag=set_g,
-                                                overpressure_basis=basis,
-                                                custom_overpressure_percent=self.p("custom_op")))
-        P1_est = set_g + dp_op + P_ATM_KPA
+    def _line(self, prefix: str):
+        from ..relief_system import LineSpec
+        return LineSpec(nps=self.p(f"{prefix}_nps"), schedule=self.p(f"{prefix}_schedule"),
+                        length=float(self.p(f"{prefix}_length")), elevation=float(self.p(f"{prefix}_elevation")),
+                        fittings=dict(self.p(f"{prefix}_fittings") or {}))
+
+    def _stream_fluid(self, st, P1_est) -> tuple[str, dict]:
         kwargs = {}
         if st.phase == "two-phase":
             fluid, kwargs["dryness"] = "wet_steam", st.x
@@ -672,15 +698,148 @@ class ReliefValveUnit(Block):
             fluid, kwargs["temperature_c"] = "water", st.T
         else:
             raise ValueError("Relief sizing is not available for supercritical conditions.")
-        rate = s.m * self.p("rate_factor") if self.p("rate_mode") == "Stream flow × factor" else self.p("rate")
-        if rate <= 0:
+        return fluid, kwargs
+
+    def _resolve_scenario(self, spec: dict) -> dict:
+        """Fill a scenario's inputs from the equipment it refers to on the drawing."""
+        from ..scenarios import SCENARIO_TYPES, condition_inputs
+        out = dict(spec)
+        st = SCENARIO_TYPES.get(spec.get("type", ""))
+        if st is None or not st.block_param or not spec.get(st.block_param):
+            return out
+        name = spec[st.block_param]
+        b = self._ctx.blocks.get(name)
+        if b is None:
+            raise ValueError(f"Scenario '{st.label}': equipment '{name}' is not on the drawing.")
+
+        def inlet(port="in"):
+            s = b.s_in(port)
+            if s is None or not s.known:
+                raise ValueError(f"Scenario '{st.label}': '{name}' has no calculated inlet.")
+            return s
+
+        if st.key == "cv_failure":
+            s = inlet()
+            if b.p("cv") <= 0:
+                raise ValueError(f"Scenario '{st.label}': enter the rated Cv of '{name}'.")
+            out.update(upstream_pressure=s.P, cv=b.p("cv"), fl=b.p("fl"), xt=b.p("xt"), **condition_inputs(s.state))
+        elif st.key == "blocked_outlet" and b.TYPE == "pump":
+            s = inlet()
+            if b.p("mode") != "Pump curve":
+                raise ValueError(f"Scenario '{st.label}': give '{name}' a pump curve.")
+            out.update(source="Pump (curve)", suction_pressure=s.P, suction_temperature=s.state.T,
+                       shutoff_head=b.p("shutoff_head"), rated_flow=b.p("rated_flow"), rated_head=b.p("rated_head"))
+        elif st.key == "loss_of_cooling":
+            s = inlet()
+            out.update(flow=s.m, **condition_inputs(s.state))
+        elif st.key == "heat_input":
+            ua = b.results.get("ua")
+            if ua is None:
+                raise ValueError(f"Scenario '{st.label}': '{name}' has no UA result yet.")
+            out.update(ua=ua.value, heating_temperature=inlet("hot_in").state.T)
+        elif st.key == "boiler_mcr":
+            steam = b.s_out("steam")
+            out.update(flow=steam.m if steam is not None and steam.known else out.get("flow"),
+                       condition="Superheated steam" if b.p("steam_condition") == "Superheated" else "Saturated steam",
+                       temperature=b.p("temperature"))
+        return out
+
+    def calculate(self):
+        if not self._ctx.final:
+            return
+        set_g = self.p("set_pressure") - P_ATM_KPA
+        basis = next(k for k, b in OVERPRESSURE_BASES.items() if b.label == self.p("overpressure"))
+        _, dp_op, _ = _overpressure(ReliefInput(fluid="saturated_steam", flow_kg_h=1.0, set_pressure_kpag=set_g,
+                                                overpressure_basis=basis,
+                                                custom_overpressure_percent=self.p("custom_op")))
+        P1_est = set_g + dp_op + P_ATM_KPA
+        scenarios_mode = self.p("rate_mode") == "Scenarios (API 521)"
+        name = self.p("stream")
+        s = self._ctx.streams.get(name) if name else None
+        if not scenarios_mode or name:
+            if not name:
+                raise ValueError("Choose the stream this relief valve protects.")
+            if s is None or not s.known:
+                raise ValueError(f"Stream '{name}' does not exist or has not been calculated.")
+        fluid, kwargs, rate = "saturated_steam", {}, 1.0
+        if s is not None and s.known:
+            if self.p("set_pressure") <= s.P:
+                self.warn(f"The set pressure is not above the operating pressure of '{name}' "
+                          f"({fmt(s.P - P_ATM_KPA)} kPa(g)): the valve would be open in normal operation.")
+            fluid, kwargs = self._stream_fluid(s.state, P1_est)
+            rate = s.m * self.p("rate_factor") if self.p("rate_mode") == "Stream flow × factor" else self.p("rate")
+        elif not scenarios_mode:
+            raise ValueError("Choose the stream this relief valve protects.")
+        if not scenarios_mode and rate <= 0:
             raise ValueError("The relieving rate is zero.")
         vt = next(k for k, v in VALVE_TYPES.items() if v == self.p("valve_type"))
-        inp = ReliefInput(fluid=fluid, flow_kg_h=rate * 3600.0, set_pressure_kpag=set_g, overpressure_basis=basis,
-                          custom_overpressure_percent=self.p("custom_op"), back_pressure_kpag=self.p("back_pressure"),
-                          valve_type=vt, kb=self.p("kb") if vt == "balanced" else None,
-                          rupture_disk=self.p("rupture_disk") == "Yes", tag=self.p("tag"),
-                          service=f"protects stream '{name}'", **kwargs)
+        service = f"protects stream '{name}'" if name else ""
+        inp = ReliefInput(fluid=fluid, flow_kg_h=max(rate, 1e-9) * 3600.0, set_pressure_kpag=set_g,
+                          overpressure_basis=basis, custom_overpressure_percent=self.p("custom_op"),
+                          back_pressure_kpag=self.p("back_pressure"), valve_type=vt,
+                          kb=self.p("kb") if vt == "balanced" else None, rupture_disk=self.p("rupture_disk") == "Yes",
+                          tag=self.p("tag"), service=service, **kwargs)
+        has_lines = self.p("inlet_line") != "None" or self.p("outlet_line") != OUTLET_LINES[0]
+        if not scenarios_mode and not has_lines:
+            self._simple(inp, rate, fluid)
+            return
+        from ..relief_system import size_relief_system
+        specs = [self._resolve_scenario(sp) for sp in (self.p("scenarios") or [])] if scenarios_mode else None
+        if scenarios_mode and not specs:
+            raise ValueError("Add at least one relief scenario.")
+        outlet_mode = self.p("outlet_line")
+        sysres = size_relief_system(
+            inp, specs,
+            inlet=self._line("inlet") if self.p("inlet_line") != "None" else None,
+            outlet=self._line("outlet") if outlet_mode != OUTLET_LINES[0] else None,
+            outlet_to="header" if outlet_mode == "Pipe to a header" else "atmosphere",
+            superimposed_kpag=float(self.p("superimposed")))
+        self.system = sysres
+        gov = sysres.governing
+        for z in sysres.sizings:
+            if z.error and z.scenario.applies:
+                self.warn(f"{z.scenario.title}: {z.error}")
+        if gov is None:
+            self.result("orifice", "API 526 orifice", "none needed", "text")
+            self.steps = list(sysres.report.steps)
+            for w in sysres.warnings:
+                self.warn(w)
+            return
+        res = gov.relief
+        self.relief = res
+        n = sysres.valves_needed
+        self.result("orifice", "API 526 orifice", sysres.orifice if n == 1 else f"{n} × {sysres.orifice}", "text")
+        self.result("area", "Required effective area", res.required_area_mm2, "area")
+        self.result("rated", "Rated capacity of selected orifice", gov.rated_kg_h / 3600.0, "mass_flow")
+        self.result("rate", "Required relieving rate", gov.scenario.rate_kg_h / 3600.0, "mass_flow")
+        self.result("governing", "Governing scenario", gov.scenario.title, "text")
+        self.result("P1", "Relieving pressure", res.relieving_pressure_kpa, "pressure")
+        self.result("fluid", "Relieving fluid", f"{FLUIDS[gov.scenario.fluid]}: {res.relieving_state.describe()}",
+                    "text")
+        self.result("regime", "Flow regime", res.flow_regime, "text")
+        self.result("method", "Method", res.governing_method, "text")
+        worst_in = max((z.inlet for z in sysres.applicable if z.inlet), key=lambda c: c.percent, default=None)
+        if worst_in is not None:
+            self.result("inlet_loss", "Inlet pressure loss (% of set pressure)", worst_in.percent, "percent")
+            self.result("inlet_ok", "Inlet loss within 3 %", "Yes" if worst_in.ok else "No", "text")
+        worst_out = max((z for z in sysres.applicable if z.discharge), key=lambda z: z.discharge.built_up,
+                        default=None)
+        if worst_out is not None:
+            self.result("built_up", "Built-up back pressure", worst_out.discharge.built_up, "pressure_diff")
+            self.result("built_up_pct", "Built-up back pressure (% of set pressure)",
+                        worst_out.discharge.built_up / set_g * 100.0, "percent")
+            self.result("total_bp", "Total back pressure (gauge)", worst_out.back_pressure_kpag, "pressure_diff")
+            self.result("v_exit", "Exit velocity", worst_out.discharge.v_exit, "velocity")
+            self.result("exit_choked", "Exit choked (sonic)", "Yes" if worst_out.discharge.choked_exit else "No",
+                        "text")
+        if sysres.reaction is not None:
+            F = max(sysres.reaction.force_n, sysres.reaction.api_force_n or 0.0)
+            self.result("reaction", "Reaction force (steady, larger of the two methods)", F / 1000.0, "force")
+        for w in sysres.warnings:
+            self.warn(w)
+        self.steps = list(sysres.report.steps)
+
+    def _simple(self, inp, rate, fluid):
         res = size_relief_valve(inp)
         self.relief = res
         self.result("orifice", "API 526 orifice",
