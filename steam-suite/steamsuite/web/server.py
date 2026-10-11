@@ -134,6 +134,23 @@ def case_study(data: dict = Body(...)) -> dict:
     return serialize.clean({"rows": rows})
 
 
+@app.post("/api/compare")
+def compare(data: dict = Body(...)) -> dict:
+    """{flowsheet: doc, text: pasted reference results} -> stream-by-stream differences."""
+    from ..compare import compare as run_compare
+    doc = data.get("flowsheet") or {}
+    fs = _flowsheet(doc)
+    _warm(fs, doc)
+    try:
+        fs.solve()
+    except (ValueError, WaterPropertyError) as exc:
+        raise _bad(exc) from exc
+    if fs.result is not None and fs.result.errors:
+        raise _bad(ValueError("The flowsheet does not solve: " + fs.result.errors[0]))
+    res = run_compare(fs, str(data.get("text") or ""))
+    return serialize.clean({"rows": res.rows, "warnings": res.warnings, "summary": res.summary})
+
+
 @app.post("/api/relief-system")
 def relief_system(data: dict = Body(...)) -> dict:
     """{valve: ReliefInput fields, scenarios: [...], inlet: LineSpec | null, outlet: LineSpec | null,
