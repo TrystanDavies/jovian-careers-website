@@ -6,7 +6,7 @@ import { h, toast, modal, download, debounce } from './dom.js';
 import { PRESETS, initUnits, setPreset, units, onUnitsChange } from './units.js';
 import { paletteIcon } from './symbols.js';
 import {
-  store, on, emit, setCatalog, replaceDoc, restoreAutosave, emptyDoc, undo, redo, autosaveNow,
+  store, on, emit, setCatalog, replaceDoc, restoreAutosave, emptyDoc, undo, redo, autosaveNow, change,
 } from './store.js';
 import {
   initCanvas, startPlacing, fitView, zoom, autoArrange, exportSVG, deleteSelection, rotateSelection, flipSelection, view,
@@ -137,6 +137,15 @@ function buildToolbar() {
     dataBtn.classList.toggle('on', store.showData);
     emit({ view: true });
   }, { cls: store.showData ? 'on' : '' });
+  const modeSel = h('select', {
+    id: 'solver-mode', 'data-key': 'solver-mode',
+    title: 'Sequential: flows come from your specifications and from what equipment asks for. '
+      + 'Pressure–flow: flows and pressures are solved together from the hydraulics (pipes, valves, pump curves), '
+      + 'so parallel branches share flow and back pressures are found.',
+  }, ...Object.entries(store.catalog.solver_modes || {}).map(([k, label]) => h('option', { value: k }, label)));
+  modeSel.value = store.doc.solver_mode || 'sequential';
+  modeSel.addEventListener('change', () => change((d) => { d.solver_mode = modeSel.value; }));
+  on((what) => { if (what.doc) modeSel.value = store.doc.solver_mode || 'sequential'; });
   const autoBtn = tbtn('Auto-solve', 'Recalculate automatically after every change', () => {
     store.autoSolve = !store.autoSolve;
     autoBtn.classList.toggle('on', store.autoSolve);
@@ -169,6 +178,7 @@ function buildToolbar() {
     dataBtn,
     h('span', { class: 'sep' }),
     tbtn('▶ Solve', 'Recalculate now', () => solveNow(), { cls: 'primary' }),
+    modeSel,
     autoBtn,
     tbtn('Case study…', 'Vary one setting and see how results change', openCaseStudy),
     reportSel,
@@ -214,7 +224,15 @@ export async function solveNow() {
   store.solving = true;
   emit({ solving: true });
   try {
-    const res = await post('/api/solve', store.doc);
+    const body = { ...store.doc };
+    // pressure–flow mode starts from the last solution (much faster after a small change)
+    const last = store.results?.streams;
+    if (store.doc.solver_mode === 'pressure_flow' && last) {
+      const warm = {};
+      for (const [n, st] of Object.entries(last)) if (st.known && st.P > 0) warm[n] = [st.m, st.P, st.h];
+      body.warm = warm;
+    }
+    const res = await post('/api/solve', body);
     if (seq !== solveSeq) return; // a newer solve has started
     store.results = res;
     // Adjust (goal seek) changes settings: keep the calculated values in the document
@@ -251,7 +269,11 @@ function updateStatus() {
   } else if (r) {
     const warn = r.warnings?.length || 0;
     dot = warn ? 'warn' : 'ok';
-    text = `Solved${r.iterations ? ` in ${r.iterations} iterations` : ''}${warn ? ` · ${warn} warning(s)` : ''}`;
+    const net = r.network && r.network.mode === 'pressure_flow' ? r.network : null;
+    text = net
+      ? `Solved (pressure–flow: ${net.equations} equations for ${net.unknowns} unknowns, ${net.time_s} s)${warn ? ` · ${warn} warning(s)` : ''}`
+      : `Solved${r.iterations ? ` in ${r.iterations} iterations` : ''}${warn ? ` · ${warn} warning(s)` : ''}`;
+    if (net?.notes?.length) text += ` · ${net.notes.join(', ')}`;
     if (r.balance && Object.keys(r.balance).length) {
       text += ` · mass balance ${Math.abs(r.balance.mass_error).toExponential(0)} kg/s · energy ${Math.abs(r.balance.energy_error).toExponential(0)} kW`;
     }
@@ -296,7 +318,8 @@ function showHelp() {
       h('li', {}, k('Ctrl+C'), ' / ', k('Ctrl+V'), ' copy and paste · ', k('Ctrl+Z'), ' / ', k('Ctrl+Y'), ' undo and redo · ', k('Ctrl+A'), ' select all'),
       h('li', {}, 'Mouse wheel: zoom · right or middle drag, or ', k('Space'), '+drag: pan · ', k('0'), ' fit to window · arrow keys: nudge')),
     h('h3', {}, 'Calculations'),
-    h('p', {}, 'Steady-state heat and mass balance with IAPWS-IF97 steam properties. Pipe segments calculate pressure drop (Darcy–Weisbach, Colebrook, Crane fittings, two-phase correlations) and heat loss; valves calculate the Cv needed; relief valves are sized to API 520. Use Adjust to make the simulator find a setting that meets a target, and Case study to see how results vary.'),
+    h('p', {}, 'Steady-state heat and mass balance with IAPWS-IF97 steam properties. Pipe segments calculate pressure drop (Darcy–Weisbach, Colebrook, Crane fittings, two-phase correlations, choking) and heat loss; valves calculate the Cv needed; relief valves are sized to API 520, from API 521 scenarios if you add them, with inlet-loss, back-pressure and reaction-force checks. Use Adjust to make the simulator find a setting that meets a target, and Case study to see how results vary.'),
+    h('p', {}, 'Solver: Sequential uses the flows you specify (and what equipment asks for). Pressure–flow solves every flow and pressure together from the hydraulics, so parallel branches share flow, pumps run on their curves and trap back pressures are found; give a sink a pressure where the water ends up. The Compare tab in the workbook checks the results against pasted HYSYS or plant data.'),
     h('p', { style: { color: 'var(--muted)' } }, 'Results are preliminary engineering calculations: have them checked by a qualified engineer before using them for design.')),
   [{ label: 'Close', primary: true }]);
 }

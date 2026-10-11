@@ -498,7 +498,9 @@ class Flowsheet:
                 switched = [b.name for b in self.blocks.values() if b.check_active_set(net, x)]
                 for i, k in enumerate(names):
                     s = self.streams[k]
-                    s.m, s.P = float(x[i]), float(x[n + i])
+                    # round-off flows (an expansion tank's ~1e-16 kg/s) are shown as zero
+                    s.m = float(x[i]) if abs(x[i]) > 1e-12 * m_ref else 0.0
+                    s.P = float(x[n + i])
                     s.locked = True
                 ctx.pressure_flow = True
                 dh = self._energy_pass(order, ctx)

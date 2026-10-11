@@ -299,7 +299,13 @@ def cooling_water_network() -> Flowsheet:
     fs.add(Pipe("L-205 CW return", inlets={"in": "CW4"}, outlets={"out": "CW5"},
                 params={"nps": "6", "length": 150.0, "elevation": 8.0, "fittings": {"elbow_90_lr": 5, "gate": 1}}))
     fs.add(Sink("Tower distribution", inlets={"in": "CW5"}, params={"pressure": P_ATM_KPA}))
-    return fs
+    pos = {"Tower basin": (80, 260), "P-201": (200, 257), "L-201 CW supply header": (340, 239),
+           "Supply manifold": (470, 239), "Return manifold": (1060, 239), "L-205 CW return": (1200, 239),
+           "Tower distribution": (1340, 239)}
+    for tag, y in (("A", 89), ("B", 239), ("C", 389)):
+        n = ord(tag) - 64
+        pos.update({f"L-20{n + 1} branch {tag}": (600, y), f"E-20{n} cooler {tag}": (770, y), f"HV-20{n}": (930, y - 11)})
+    return _place(fs, pos)
 
 
 def condensate_return_network() -> Flowsheet:
@@ -337,7 +343,12 @@ def condensate_return_network() -> Flowsheet:
     fs.add(FlashVessel("Condensate receiver", inlets={"in": "CD2"}, outlets={"vapour": "Flash to vent",
                                                                            "liquid": "Receiver outlet"},
                        params={"pressure": barg(0.1), "inlet_specs": {"CD2": "Open"}}))
-    return fs
+    pos = {"Steam main": (80, 270), "Steam branches": (200, 270), "Return header": (800, 341),
+           "L-304 condensate return": (940, 341), "Condensate receiver": (1080, 348)}
+    for tag, y in (("A", 100), ("B", 270), ("C", 440)):
+        n = ord(tag) - 64
+        pos.update({f"Heater {tag}": (340, y + 10), f"ST-10{n} trap": (500, y + 60), f"L-30{n} drain {tag}": (660, y + 71)})
+    return _place(fs, pos, ends={"Flash to vent": (1080, 220), "Receiver outlet": (1080, 480)})
 
 
 def closed_heating_loop() -> Flowsheet:
@@ -353,7 +364,7 @@ def closed_heating_loop() -> Flowsheet:
     fs.add(Feed("Expansion tank", outlets={"out": "X"},
                 params={"pressure": barg(1.5), "temperature": 60.0,
                         "flow_mode": "Pressure reference (expansion tank)", "flow": 0.0}))
-    fs.add(Mixer("Pump suction", inlets={"in": ["HW-R2", "X"]}, outlets={"out": "HW1"},
+    fs.add(Mixer("Pump suction", inlets={"in": ["X", "HW-R2"]}, outlets={"out": "HW1"},
                  params={"pressure_mode": "Equal pressures (junction)"}))
     fs.add(Pump("P-401", inlets={"in": "HW1"}, outlets={"out": "HW2"},
                 params={"mode": "Pump curve", "shutoff_head": 22.0, "rated_flow": 40.0, "rated_head": 16.0,
@@ -376,7 +387,13 @@ def closed_heating_loop() -> Flowsheet:
                  params={"pressure_mode": "Equal pressures (junction)"}))
     fs.add(Pipe("L-404 return main", inlets={"in": "HW-R1"}, outlets={"out": "HW-R2"},
                 params={"nps": "4", "length": 80.0, "fittings": {"elbow_90_lr": 6, "gate": 2}}))
-    return fs
+    return _place(fs, {
+        "Expansion tank": (90, 80), "Pump suction": (200, 201), "P-401": (300, 198),
+        "E-401 boiler heat exchanger": (430, 180), "L-401 flow main": (570, 180), "Flow manifold": (690, 180),
+        "L-402 circuit A": (810, 110), "Heating circuit A": (950, 110),
+        "L-403 circuit B": (810, 250), "Heating circuit B": (950, 250),
+        "Return manifold": (1070, 180), "L-404 return main": (640, 340, 0, True),
+    })
 
 
 EXAMPLES = {

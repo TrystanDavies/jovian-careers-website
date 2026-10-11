@@ -6,6 +6,7 @@ import { h, toast } from './dom.js';
 import { show, fmt, toUser, fromUser, unitLabel, inputValue, describeState, NUMERIC_KINDS } from './units.js';
 import { stepsView } from './report.js';
 import { lineChart } from './charts.js';
+import { scenarioEditor } from './scenarios.js';
 import {
   insertOnStream, addReliefOnStream, deleteSelection, rotateSelection, flipSelection, duplicate,
 } from './canvas.js';
@@ -159,6 +160,9 @@ function designTab(b, t) {
       out.push(msg('info', 'Draw a line from an outlet nozzle to this unit\'s inlet nozzle, or drag out of the inlet nozzle to create a water/steam supply.'));
     }
   }
+  // inlet connection type (vessels): throttled or open, used in pressure–flow mode
+  const openPorts = t.inlets.filter((p) => p.open_option);
+  if (openPorts.length) out.push(...inletSpecs(b, openPorts));
   // outlet flow specifications (splitter, header)
   const specPort = t.outlets.find((p) => p.with_specs);
   if (specPort) out.push(...outletSpecs(b, specPort));
@@ -205,8 +209,41 @@ function outletSpecs(b, port) {
     names.length ? h('table', { class: 'mini-table' }, h('thead', {}, h('tr', {}, h('th', {}, 'Stream'), h('th', {}, 'Flow'), h('th', {}, 'Value'))), h('tbody', {}, ...rows))
       : msg('info', 'Draw lines from the outlet nozzle to add outlets.'),
     h('div', { class: 'help', style: { color: 'var(--faint)', fontSize: '11px', margin: '4px 0' } },
-      'Flow: fixed · Fraction: % of the total · As required: whatever the connected unit needs · Remainder: what is left.'),
+      'Flow: fixed · Fraction: % of the total · As required: whatever the connected unit needs · Remainder: what is left · '
+      + 'Pressure-driven: found from the hydraulics (pressure–flow mode).'),
   ];
+}
+
+function inletSpecs(b, ports) {
+  const names = ports.flatMap((pd) => [].concat(b.inlets[pd.key] || []));
+  if (!names.length) return [];
+  const specs = b.params.inlet_specs || {};
+  const pf = store.doc.solver_mode === 'pressure_flow';
+  const rows = names.map((n) => h('tr', {},
+    h('td', {}, h('span', { class: 'chip', onclick: () => select([], [n]) }, n)),
+    h('td', {}, segmented(store.catalog.inlet_modes || ['Throttled', 'Open'], specs[n] || 'Throttled', (v) => change((d) => {
+      const bb = d.blocks.find((x) => x.name === b.name);
+      bb.params.inlet_specs = { ...(bb.params.inlet_specs || {}), [n]: v };
+    }), `inlet-mode-${n}`))));
+  return [
+    h('div', { class: 'group-title' }, 'Inlet connections'),
+    h('table', { class: 'mini-table' }, h('thead', {}, h('tr', {}, h('th', {}, 'Stream'), h('th', {}, 'Connection'))), h('tbody', {}, ...rows)),
+    h('div', { class: 'help', style: { color: 'var(--faint)', fontSize: '11px', margin: '4px 0' } },
+      'Throttled: a control valve or trap drops the line to the vessel pressure. Open: the line discharges straight in, so it '
+      + 'arrives at the vessel pressure — in pressure–flow mode this sets the back pressure (or the flow) upstream.'
+      + (pf ? '' : ' Used in pressure–flow mode.')),
+  ];
+}
+
+// --- relief scenarios -----------------------------------------------------------------------------
+
+function scenariosEditor(b, p) {
+  return scenarioEditor(b.params[p.key] || [], (list) => change((d) => {
+    d.blocks.find((x) => x.name === b.name).params[p.key] = list;
+  }), {
+    blocks: (types) => store.doc.blocks.filter((x) => types.includes(x.type)).map((x) => x.name),
+    governing: resultMap(b.name).governing?.value,
+  });
 }
 
 const DYNAMIC = new Set(['inlet_choice', 'stream_choice', 'block_choice', 'param_choice', 'result_choice']);
@@ -227,6 +264,7 @@ function paramEditor(b, p) {
   }
   if (DYNAMIC.has(p.kind)) return field(p.label, dynamicSelect(b, p, val, set, key), '', p.help);
   if (p.kind === 'fittings') return fittingsEditor(b, p);
+  if (p.kind === 'scenarios') return scenariosEditor(b, p);
   if (p.kind === 'target_value' || p.kind === 'adjust_bound') {
     let kind = 'number';
     if (p.kind === 'target_value') {
@@ -254,7 +292,7 @@ function dynamicSelect(b, p, val, set, key) {
   } else if (p.kind === 'stream_choice') {
     options = Object.keys(streams()).sort((a, c) => a.localeCompare(c, undefined, { numeric: true }));
   } else if (p.kind === 'block_choice') {
-    options = store.doc.blocks.filter((x) => x.name !== b.name && !['adjust', 'relief_valve'].includes(x.type)).map((x) => x.name);
+    options = store.doc.blocks.filter((x) => x.name !== b.name && !['adjust', 'relief_valve', 'specification'].includes(x.type)).map((x) => x.name);
   } else if (p.kind === 'param_choice') {
     const other = block(b.params[p.depends_on]);
     if (other) {
@@ -368,6 +406,7 @@ function streamPanel(name) {
       h('button', { class: 'btn small', onclick: () => insertOnStream(name, 'pipe') }, '＋ Pipe segment'),
       h('button', { class: 'btn small', onclick: () => insertOnStream(name, 'valve') }, '＋ Valve'),
       h('button', { class: 'btn small', onclick: () => insertOnStream(name, 'heater') }, '＋ Heater/cooler'),
+      h('button', { class: 'btn small', onclick: () => insertOnStream(name, 'check_valve') }, '＋ Check valve'),
       h('button', { class: 'btn small', onclick: () => addReliefOnStream(name) }, '＋ Relief valve')),
     h('div', { class: 'actions' }, h('button', { class: 'btn small danger', onclick: deleteSelection }, '✕ Delete stream')));
   return [head, body];
@@ -409,6 +448,21 @@ function docPanel() {
     if (s.cycle_efficiency) kpis.push(['Cycle efficiency', s.cycle_efficiency * 100, 'percent']);
     body.append(h('div', { class: 'group-title' }, 'Key figures'),
       h('div', { class: 'kpis' }, ...kpis.map(([l, v, k]) => h('div', { class: 'kpi' }, h('div', { class: 'l' }, l), h('div', { class: 'v' }, show(k, v, 4))))));
+  }
+  const pf = d.solver_mode === 'pressure_flow';
+  body.append(h('div', { class: 'group-title' }, 'Solver'),
+    h('div', { class: 'field wide' }, segmented(['Sequential', 'Pressure–flow'], pf ? 'Pressure–flow' : 'Sequential',
+      (v) => change((doc) => { doc.solver_mode = v === 'Pressure–flow' ? 'pressure_flow' : 'sequential'; }), 'doc-solver')),
+    h('div', { class: 'help', style: { color: 'var(--faint)', fontSize: '11px', margin: '2px 0 6px' } }, pf
+      ? 'Flows and pressures are solved together from pipes, valves, pump curves and fixed pressures: parallel branches share flow, pumps run on their curves, back pressures are found. Supplies set to "As required" deliver whatever the pressures drive.'
+      : 'Flows come from your specifications and from what equipment asks for; pressures are worked out downstream. Switch to pressure–flow to have the hydraulics set the flows.'));
+  if (pf && res?.network?.equations) {
+    const n = res.network;
+    body.append(h('table', { class: 'kv' }, h('tbody', {},
+      h('tr', {}, h('td', {}, 'Equations / unknowns'), h('td', {}, `${n.equations} / ${n.unknowns}`)),
+      h('tr', {}, h('td', {}, 'Newton iterations'), h('td', {}, String(n.newton_iterations))),
+      h('tr', {}, h('td', {}, 'Solution time'), h('td', {}, `${n.time_s} s`)),
+      ...(n.notes || []).map((t) => h('tr', {}, h('td', {}, 'Note'), h('td', {}, t))))));
   }
   if (res?.balance && Object.keys(res.balance).length) {
     const b = res.balance;

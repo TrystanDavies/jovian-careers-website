@@ -28,28 +28,30 @@ const F = {
   velocity: { 'm/s': 1, 'ft/s': 0.3048 },
   area: { 'mm²': 1, 'cm²': 100, 'in²': 645.16 },
   ua: { 'kW/K': 1, 'Btu/(h·°F)': 0.00052752793 },
+  force: { kN: 1, N: 0.001, lbf: 0.0044482216 },
+  surface_area: { 'm²': 1, 'ft²': 0.09290304 },
 };
 
 export const PRESETS = {
   metric: {
     label: 'Metric (bar g, °C, t/h)', pressure: 'bar(g)', temperature: '°C', mass_flow: 't/h', power: 'kW',
     enthalpy: 'kJ/kg', entropy: 'kJ/(kg·K)', density: 'kg/m³', length: 'm', diameter: 'mm', head: 'm',
-    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K',
+    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K', force: 'kN', surface_area: 'm²',
   },
   metric_abs: {
     label: 'Metric absolute (bar a, °C, t/h)', pressure: 'bar(a)', temperature: '°C', mass_flow: 't/h', power: 'kW',
     enthalpy: 'kJ/kg', entropy: 'kJ/(kg·K)', density: 'kg/m³', length: 'm', diameter: 'mm', head: 'm',
-    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K',
+    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K', force: 'kN', surface_area: 'm²',
   },
   si: {
     label: 'SI (kPa a, °C, kg/s)', pressure: 'kPa(a)', temperature: '°C', mass_flow: 'kg/s', power: 'kW',
     enthalpy: 'kJ/kg', entropy: 'kJ/(kg·K)', density: 'kg/m³', length: 'm', diameter: 'mm', head: 'm',
-    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K',
+    volume_flow: 'm³/h', velocity: 'm/s', area: 'mm²', ua: 'kW/K', force: 'kN', surface_area: 'm²',
   },
   us: {
     label: 'US customary (psig, °F, lb/h)', pressure: 'psig', temperature: '°F', mass_flow: 'lb/h', power: 'Btu/h',
     enthalpy: 'Btu/lb', entropy: 'Btu/(lb·°F)', density: 'lb/ft³', length: 'ft', diameter: 'in', head: 'ft',
-    volume_flow: 'gpm', velocity: 'ft/s', area: 'in²', ua: 'Btu/(h·°F)',
+    volume_flow: 'gpm', velocity: 'ft/s', area: 'in²', ua: 'Btu/(h·°F)', force: 'lbf', surface_area: 'ft²',
   },
 };
 
@@ -189,4 +191,4 @@ export function describeState(st) {
 
 export const NUMERIC_KINDS = new Set(['pressure', 'pressure_diff', 'temperature', 'temperature_diff', 'mass_flow',
   'power', 'percent', 'fraction', 'number', 'length', 'diameter', 'roughness', 'head', 'volume_flow', 'ua', 'htc',
-  'conductivity', 'velocity', 'area', 'enthalpy', 'entropy', 'density']);
+  'conductivity', 'velocity', 'area', 'enthalpy', 'entropy', 'density', 'force', 'surface_area']);

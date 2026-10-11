@@ -212,6 +212,11 @@ export function addBlock(d, type, x, y, name = null) {
   const t = store.types[type];
   const b = { type, name: nm, inlets: {}, outlets: {}, params: defaultParams(type) };
   if (t.outlets.some((p) => p.with_specs)) b.params.outlet_specs = {};
+  if (t.inlets.some((p) => p.open_option)) b.params.inlet_specs = {};
+  // new pipes use the drift-flux void fraction (better static head in rising two-phase lines)
+  if (type === 'pipe' && 'void_model' in b.params) b.params.void_model = 'Drift flux (Rouhani–Axelsson)';
+  // in pressure–flow mode new junctions mix at equal pressure
+  if (type === 'mixer' && d.solver_mode === 'pressure_flow') b.params.pressure_mode = 'Equal pressures (junction)';
   d.blocks.push(b);
   d.layout.nodes[nm] = { x: Math.round(x / 10) * 10, y: Math.round(y / 10) * 10, rot: 0, flip: false };
   return b;
@@ -255,16 +260,20 @@ export function connect(d, src, dst) {
   } else {
     name = uniqueStreamName(d);
     setPort(sb, 'out', src.port, sdef, [...outList, name]);
-    addOutletSpec(sb, sdef, name);
+    addOutletSpec(sb, sdef, name, d);
   }
   setPort(db, 'in', dst.port, ddef, [...inList, name]);
   return { name };
 }
 
-function addOutletSpec(b, def, name) {
+function addOutletSpec(b, def, name, d = store.doc) {
   if (!def.with_specs) return;
   b.params.outlet_specs ||= {};
   const specs = b.params.outlet_specs;
+  if (d?.solver_mode === 'pressure_flow') {
+    specs[name] = { mode: 'Pressure-driven', value: 0 }; // the network finds the split
+    return;
+  }
   const hasRemainder = Object.values(specs).some((s) => s.mode === 'Remainder');
   specs[name] = b.type === 'splitter' && !hasRemainder ? { mode: 'Remainder', value: 0 } : { mode: 'As required', value: 0 };
 }
@@ -277,9 +286,16 @@ export function addProductStream(d, src, x, y) {
   if (!sdef.multiple && outList.length) return { error: `${sdef.label} of ${sb.name} already has a stream.` };
   const name = uniqueStreamName(d);
   setPort(sb, 'out', src.port, sdef, [...outList, name]);
-  addOutletSpec(sb, sdef, name);
+  addOutletSpec(sb, sdef, name, d);
   d.layout.streams[name] = { ...(d.layout.streams[name] || {}), end: { x, y } };
   return { name };
+}
+
+const SCENARIO_REFS = ['valve', 'pump', 'condenser', 'exchanger', 'boiler'];
+
+/** Visit the equipment names that relief scenarios refer to: fn(scenario, key). */
+function eachScenarioRef(b, fn) {
+  for (const sc of b.params?.scenarios || []) for (const k of SCENARIO_REFS) if (sc[k]) fn(sc, k);
 }
 
 /** Disconnect a stream from its destination (it then leaves the system) or delete it entirely. */
@@ -292,6 +308,7 @@ export function deleteStream(d, name) {
       }
     }
     if (b.params.outlet_specs) delete b.params.outlet_specs[name];
+    if (b.params.inlet_specs) delete b.params.inlet_specs[name];
     for (const key of ['balancing_inlet', 'makeup_inlet', 'stream', 'target_stream']) {
       if (b.params[key] === name) b.params[key] = '';
     }
@@ -319,6 +336,7 @@ export function deleteBlocks(d, names) {
   for (const n of names) delete d.layout.nodes[n];
   for (const b of d.blocks) {
     for (const key of ['var_block', 'target_block']) if (set.has(b.params[key])) b.params[key] = '';
+    eachScenarioRef(b, (sc, k) => { if (set.has(sc[k])) sc[k] = ''; });
   }
 }
 
@@ -342,6 +360,7 @@ export function renameBlock(d, oldName, newName) {
   delete d.layout.nodes[oldName];
   for (const o of d.blocks) {
     for (const key of ['var_block', 'target_block']) if (o.params[key] === oldName) o.params[key] = newName;
+    eachScenarioRef(o, (sc, k) => { if (sc[k] === oldName) sc[k] = newName; });
   }
   return null;
 }
@@ -356,8 +375,9 @@ export function renameStream(d, oldName, newName) {
         else if (v === oldName) b[side][port] = newName;
       }
     }
-    const specs = b.params.outlet_specs;
-    if (specs && specs[oldName]) { specs[newName] = specs[oldName]; delete specs[oldName]; }
+    for (const specs of [b.params.outlet_specs, b.params.inlet_specs]) {
+      if (specs && specs[oldName] !== undefined) { specs[newName] = specs[oldName]; delete specs[oldName]; }
+    }
     for (const key of ['balancing_inlet', 'makeup_inlet', 'stream', 'target_stream']) {
       if (b.params[key] === oldName) b.params[key] = newName;
     }
@@ -388,6 +408,10 @@ export function insertInline(d, streamName, type) {
     setPort(db, 'in', s.dst.port, ddef, list);
     for (const o of d.blocks) {
       for (const key of ['balancing_inlet', 'makeup_inlet']) if (o === db && o.params[key] === streamName) o.params[key] = newName;
+    }
+    if (db.params.inlet_specs && db.params.inlet_specs[streamName] !== undefined) {
+      db.params.inlet_specs[newName] = db.params.inlet_specs[streamName];
+      delete db.params.inlet_specs[streamName];
     }
   } else {
     d.layout.streams[newName] = { end: bEnd };
@@ -421,8 +445,8 @@ export function copySelection() {
         else if (!internal.has(v)) delete b[side][port];
       }
     }
-    if (b.params.outlet_specs) {
-      for (const k of Object.keys(b.params.outlet_specs)) if (!internal.has(k)) delete b.params.outlet_specs[k];
+    for (const specs of [b.params.outlet_specs, b.params.inlet_specs]) {
+      if (specs) for (const k of Object.keys(specs)) if (!internal.has(k)) delete specs[k];
     }
   }
   const nodes = Object.fromEntries(names.map((n) => [n, { ...store.doc.layout.nodes[n] }]));
@@ -457,11 +481,12 @@ export function paste(d, clip, dx = 40, dy = 40) {
         nb[side][port] = Array.isArray(v) ? v.map((n) => streamMap[n]) : streamMap[v];
       }
     }
-    if (nb.params.outlet_specs) {
-      nb.params.outlet_specs = Object.fromEntries(Object.entries(nb.params.outlet_specs).map(([k, v]) => [streamMap[k], v]));
+    for (const key of ['outlet_specs', 'inlet_specs']) {
+      if (nb.params[key]) nb.params[key] = Object.fromEntries(Object.entries(nb.params[key]).map(([k, v]) => [streamMap[k], v]));
     }
     for (const key of ['balancing_inlet', 'makeup_inlet']) if (nb.params[key]) nb.params[key] = streamMap[nb.params[key]] || '';
     for (const key of ['var_block', 'target_block']) if (nameMap[nb.params[key]]) nb.params[key] = nameMap[nb.params[key]];
+    eachScenarioRef(nb, (sc, k) => { if (nameMap[sc[k]]) sc[k] = nameMap[sc[k]]; });
   }
   return created.map((b) => b.name);
 }

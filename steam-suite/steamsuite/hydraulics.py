@@ -5,11 +5,15 @@
   (64/Re in laminar flow, interpolated across the transition region).
 * Fittings: Crane TP-410 equivalent lengths, K = (L/D)·f_T, where f_T is the
   fully turbulent friction factor of clean commercial steel of the same bore.
-* Two-phase flow: homogeneous model or the Müller-Steinhagen & Heck
-  correlation for friction; homogeneous density for static head and
-  acceleration.
+* Two-phase friction: Müller-Steinhagen & Heck (default), Friedel,
+  Chisholm (Lockhart–Martinelli) or homogeneous flow; static head and
+  acceleration from the homogeneous or a drift-flux (Rouhani–Axelsson)
+  void fraction.
 * Compressible flow (steam) and changing phase are handled by marching along
-  the pipe in segments, updating the properties from IAPWS-IF97 at each step.
+  the pipe in segments, updating the properties from IAPWS-IF97 at each step;
+  near the speed of sound the march switches to pressure steps, which find
+  the choking point exactly (homogeneous-equilibrium speed of sound for wet
+  steam).
 * Heat loss through insulation to ambient air.
 * Control valves: IEC 60534-2-1 / ISA-75.01 flow coefficient (Cv) equations.
 
@@ -419,17 +423,17 @@ def pipe_flow(m: float, P_in: float, h_in: float, d_mm: float, length: float, ep
 
     The pipe is divided into segments. In each, the friction, fittings (K
     spread evenly along the pipe), static head and acceleration pressure
-    changes are integrated with the trapezoidal rule (a predictor and two
-    corrector passes, so the result is second-order accurate), and the
-    enthalpy is updated from the energy balance: heat loss, elevation and
-    kinetic energy.
+    changes are integrated with the trapezoidal rule (a predictor, then
+    corrector passes until the end pressure settles, so the result is
+    second-order accurate), and the enthalpy is updated from the energy
+    balance: heat loss, elevation and kinetic energy.
 
     The default is 20 segments (about 0.01 % numerical error for a 20 %
     pressure drop), or 60 when the pressure drop exceeds a quarter of the
     inlet pressure. A fixed count keeps the result a smooth function of the
     inputs, which goal-seeking needs.
 
-    Where the Mach number exceeds 0.6 the rest of the pipe is integrated in
+    Where the Mach number exceeds 0.3 the rest of the pipe is integrated in
     small pressure steps instead (the length of each step follows from the
     momentum balance, the state from the energy balance). This resolves
     choking exactly: if the flow reaches the speed of sound before the end of

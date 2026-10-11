@@ -204,17 +204,22 @@ function subtitle(b) {
       const len = `${fmt(toUser('length', p.length), 3)} ${unitLabel('length')}`;
       return [`${size} · ${len}`, res.dP ? `ΔP ${val('dP')}` : null];
     }
-    case 'valve': return [res.cv ? `Cv ${fmt(res.cv.value, 3)}${res.opening ? ` · ${fmt(res.opening.value, 2)}% open` : ''}` : null];
-    case 'relief_valve': return [res.orifice ? `${p.tag || ''} · orifice ${res.orifice.value}` : p.tag || ''];
+    case 'valve': return [p.mode && p.mode.startsWith('Free') ? `trap${res.dP ? ` · ΔP ${val('dP')}` : ''}` : res.cv ? `Cv ${fmt(res.cv.value, 3)}${res.opening ? ` · ${fmt(res.opening.value, 2)}% open` : ''}` : null];
+    case 'relief_valve': return [res.orifice ? `${p.tag || ''} · orifice ${res.orifice.value}` : p.tag || '',
+      res.governing ? res.governing.value : null];
     case 'heat_exchanger': return [val('duty')];
     case 'pump': case 'compressor': return [val('power')];
     case 'turbine': return [val('electric')];
     case 'boiler': return [val('steam')];
-    case 'header': return [show('pressure', p.pressure, 3)];
+    case 'header': return [p.pressure_mode && p.pressure_mode.startsWith('Calculated') ? (res.P ? val('P') : 'junction') : show('pressure', p.pressure, 3)];
     case 'steam_user': return [val('duty')];
     case 'feed': return [res.flow ? `${val('flow')} · ${val('temperature')}` : null];
     case 'deaerator': case 'flash': return [show('pressure', p.pressure, 3)];
     case 'adjust': return [p.var_block ? `varies ${p.var_block}` : 'not set up'];
+    case 'sink': return [p.mode === 'Flow' ? show('mass_flow', p.flow, 3) : show('pressure', p.pressure, 3)];
+    case 'check_valve': return [res.state ? `${res.state.value}${res.dP ? ` · ΔP ${val('dP')}` : ''}` : null];
+    case 'specification': return [p.stream ? `${p.stream}: ${p.property === 'Pressure' ? show('pressure', p.pressure, 3) : show('mass_flow', p.flow, 3)}` : 'not set up'];
+    case 'mixer': return [p.pressure_mode && p.pressure_mode.startsWith('Equal') ? 'junction' : null];
     default: return [];
   }
 }
@@ -279,6 +284,17 @@ function overlaps(r, list) {
   return list.some((o) => r.x < o.x1 && r.x + r.w > o.x0 && r.y < o.y1 && r.y + r.h > o.y0);
 }
 
+// how badly a label would cover what is already drawn (covering equipment counts more than other labels)
+function clutter(r, list) {
+  let a = 0;
+  for (const o of list) {
+    const w = Math.min(r.x + r.w, o.x1) - Math.max(r.x, o.x0);
+    const h = Math.min(r.y + r.h, o.y1) - Math.max(r.y, o.y0);
+    if (w > 0 && h > 0) a += w * h * (o.node ? 4 : 1);
+  }
+  return a;
+}
+
 /** Label position: the user's offset if set, else the first spot along the line that avoids clutter. */
 function placeLabel(name, gm, w, hgt, occupied) {
   const segs = segmentsByLength(gm.pts);
@@ -307,7 +323,14 @@ function placeLabel(name, gm, w, hgt, occupied) {
   for (const c of candidates) {
     if (!overlaps({ x: c.x, y: c.y, w, h: hgt }, occupied)) return c;
   }
-  return base(first);
+  // nowhere is clear: take the spot that covers the least
+  let best = base(first);
+  let least = clutter({ ...best, w, h: hgt }, occupied);
+  for (const c of candidates) {
+    const a = clutter({ x: c.x, y: c.y, w, h: hgt }, occupied);
+    if (a < least) { best = c; least = a; }
+  }
+  return best;
 }
 
 export function render() {
@@ -321,7 +344,7 @@ export function render() {
     if (!n) continue;
     const box = nodeBox(b.type, n);
     const tw = Math.max(box.w, b.name.length * 6.5);
-    occupied.push({ x0: n.x - tw / 2 - 2, x1: n.x + tw / 2 + 2, y0: box.y0 - 2, y1: box.y1 + 30 });
+    occupied.push({ x0: n.x - tw / 2 - 2, x1: n.x + tw / 2 + 2, y0: box.y0 - 2, y1: box.y1 + 30, node: true });
   }
   // pipes
   let edges = '';
@@ -355,7 +378,7 @@ export function render() {
     if (!n) continue;
     const [ax, ay] = anchorPoint(b.type, n);
     const targets = [];
-    if (b.type === 'relief_valve' && b.params.stream && geo[b.params.stream]) targets.push(geo[b.params.stream].labelAt || labelPoint(geo[b.params.stream].pts));
+    if (['relief_valve', 'specification'].includes(b.type) && b.params.stream && geo[b.params.stream]) targets.push(geo[b.params.stream].labelAt || labelPoint(geo[b.params.stream].pts));
     if (b.type === 'adjust') {
       for (const key of ['var_block', 'target_block']) {
         const tn = b.params[key] && node(b.params[key]);
@@ -885,6 +908,7 @@ function openContextMenu(cx, cy, hit, w) {
     add('Insert valve', () => insertOnStream(name, 'valve'));
     add('Insert heater / cooler', () => insertOnStream(name, 'heater'));
     add('Insert pump', () => insertOnStream(name, 'pump'));
+    add('Insert check valve', () => insertOnStream(name, 'check_valve'));
     add('Add relief valve (PSV) on this line', () => {
       const lp = labelPoint(geometryCache[name].pts);
       let made;

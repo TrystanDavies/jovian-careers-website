@@ -113,6 +113,24 @@ export const SYMBOLS = {
     ports: {},
     anchor: { x: 21, y: 51 },
   },
+  sink: {
+    w: 72, h: 34,
+    draw: () => `<path ${SF} d="M17 1 H71 V33 H17 L1 17 Z"/><path ${ST} d="M28 17 H60 M52 11 L60 17 L52 23"/>`,
+    ports: { in: { side: 'l', t: 0.5 } },
+  },
+  check_valve: {
+    w: 44, h: 30,
+    draw: () => `<path ${S} d="M1 6 L1 24 L22 15 Z M43 6 L43 24 L22 15 Z"/><path class="sym-fill" d="M1 6 L1 24 L22 15 Z"/>
+      <path ${ST} d="M22 3 V27"/>`,
+    ports: { in: { side: 'l', t: 0.5 }, out: { side: 'r', t: 0.5 } },
+  },
+  specification: {
+    w: 46, h: 42,
+    draw: () => `<rect ${S} x="2" y="2" width="42" height="38" rx="6" style="stroke-dasharray:4 2"/>
+      <text x="23" y="25" text-anchor="middle" font-size="10" font-weight="700" fill="#33404d" style="pointer-events:none">SPEC</text>`,
+    ports: {},
+    anchor: { x: 23, y: 21 },
+  },
   adjust: {
     w: 42, h: 42,
     draw: () => `<circle ${S} cx="21" cy="21" r="19" style="stroke-dasharray:4 2"/>
@@ -203,4 +221,5 @@ export const TAG_PREFIX = {
   feed: 'IN-', pump: 'P-', compressor: 'K-', turbine: 'T-', valve: 'V-', boiler: 'B-', heater: 'E-',
   condenser: 'C-', heat_exchanger: 'E-', mixer: 'MIX-', splitter: 'TEE-', header: 'HDR-', flash: 'V-',
   desuperheater: 'DSH-', deaerator: 'D-', steam_user: 'U-', pipe: 'L-', relief_valve: 'PSV-', adjust: 'ADJ-',
+  sink: 'OUT-', check_valve: 'NRV-', specification: 'FC-',
 };

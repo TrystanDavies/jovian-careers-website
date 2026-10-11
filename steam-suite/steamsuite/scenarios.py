@@ -213,7 +213,7 @@ def fire(inputs: dict, P1: float) -> ScenarioResult:
 
 
 def _valve_upstream(inputs: dict) -> WaterState:
-    return _state_from_inputs(float(_p(inputs, "upstream_pressure", 1101.325)), _p(inputs, "condition",
+    return _state_from_inputs(float(_p(inputs, "upstream_pressure", 1701.325)), _p(inputs, "condition",
                               "Saturated steam"), _p(inputs, "temperature"), _p(inputs, "dryness"))
 
 
@@ -438,7 +438,7 @@ def given_rate(inputs: dict, P1: float) -> ScenarioResult:
 
 
 _VALVE_PARAMS = [
-    Param("upstream_pressure", "Highest upstream pressure", "pressure", 1101.325),
+    Param("upstream_pressure", "Highest upstream pressure", "pressure", 1701.325),
     *_cond_params(),
     Param("cv", "Valve Cv, fully open", "number", 50.0, min_value=0.0),
     Param("bypass_open", "Bypass open in normal operation", "choice", "No", choices=("No", "Yes")),

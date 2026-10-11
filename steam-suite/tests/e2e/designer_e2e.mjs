@@ -29,6 +29,11 @@ async function dragMouse(page, from, to, button = 'left') {
   await page.mouse.up({ button });
 }
 const status = (page) => page.locator('#statusbar').innerText();
+async function streamFlow(page, name) {
+  await page.locator('#workbook-head button', { hasText: 'Streams' }).click();
+  const row = page.locator('#workbook-body tbody tr').filter({ has: page.locator('td:first-child', { hasText: new RegExp(`^\\s*${name}\\s*$`) }) });
+  return Number((await row.locator('td').nth(3).innerText()).replace(/,/g, ''));
+}
 
 (async () => {
   const browser = await chromium.launch();
@@ -172,6 +177,64 @@ const status = (page) => page.locator('#statusbar').innerText();
   check((await page.locator('.modal .mini-table tbody tr').count()) === 6, 'case study table has 6 rows');
   await page.locator('.modal header button').click();
 
+  console.log('Pressure–flow mode');
+  await page.selectOption('#toolbar select', { label: 'Cooling-water network (pressure–flow)' });
+  await settle(page);
+  check(/pressure–flow: 34 equations for 34 unknowns/.test(await status(page)), 'parallel cooling-water network solves as a pressure–flow network');
+  const flowsBefore = [await streamFlow(page, 'CW-A1'), await streamFlow(page, 'CW-B1'), await streamFlow(page, 'CW-C1')];
+  const pumpFlow = await streamFlow(page, 'CW2');
+  check(flowsBefore.every((f) => f > 0) && new Set(flowsBefore.map((f) => f.toFixed(1))).size === 3,
+    `branches take different flows by their resistance (${flowsBefore.join(', ')} t/h)`);
+  check(Math.abs(flowsBefore.reduce((a, b) => a + b, 0) - pumpFlow) < 0.05, 'branch flows add up to the pump flow');
+  await page.locator('#workbook-head button', { hasText: 'Equipment' }).click();
+  await page.locator('#workbook-body tbody tr', { hasText: 'HV-201' }).click();
+  const opening = page.locator('#inspector input[data-key="p-opening"]');
+  await opening.fill('25');
+  await opening.press('Enter');
+  await settle(page);
+  const flowA = await streamFlow(page, 'CW-A1');
+  const flowB = await streamFlow(page, 'CW-B1');
+  check(flowA < flowsBefore[0] - 1 && flowB > flowsBefore[1], 'throttling a balancing valve moves flow to the other branches');
+  await page.locator('.palette-item[data-type="sink"]').dragTo(canvas, { targetPosition: { x: 300, y: 600 } });
+  await settle(page);
+  check((await page.locator('#pid .node[data-node^="OUT-"]').count()) === 1, 'a product/sink can be placed from the palette');
+  await page.keyboard.press('Delete');
+  await settle(page);
+  await page.selectOption('#toolbar select', { label: 'Steam distribution with pipes and relief valves' });
+  await settle(page);
+  await page.selectOption('#solver-mode', 'pressure_flow');
+  await settle(page);
+  check(/pressure–flow: \d+ equations for \d+ unknowns/.test(await status(page)), 'the solver can be switched to pressure–flow in the toolbar');
+  await page.selectOption('#solver-mode', 'sequential');
+  await settle(page);
+
+  console.log('Relief scenarios on the drawing');
+  await page.locator('#pid .node[data-node="PSV-101"] .body').click({ force: true });
+  await page.selectOption('#inspector select[data-key="p-rate_mode"]', 'Scenarios (API 521)');
+  await settle(page);
+  await page.selectOption('#inspector select[data-key="sc-add"]', 'cv_failure');
+  await settle(page);
+  await page.selectOption('#inspector select[data-key="sc-0-valve"]', 'PCV-101');
+  await settle(page);
+  await page.selectOption('#inspector select[data-key="sc-add"]', 'fire');
+  await settle(page);
+  check((await page.locator('#inspector .scenario-card').count()) === 2, 'two relief scenarios added to the PSV');
+  check((await page.locator('#inspector .scenario-card.governs').count()) === 1, 'the governing scenario is highlighted');
+  await page.locator('#inspector .insp-tabs button', { hasText: 'Results' }).click();
+  const scRes = await page.locator('#inspector .kv').innerText();
+  check(/Governing scenario\s+Control valve fails open/.test(scRes), 'the failed-open PRV governs, with values from PCV-101 on the drawing');
+  await page.locator('#workbook-head button', { hasText: 'Relief' }).click();
+  check((await page.locator('#workbook-body').innerText()).includes('Control valve fails open'), 'relief workbook lists the governing scenario');
+
+  console.log('Compare with reference results');
+  await page.locator('#workbook-head button', { hasText: 'Compare' }).click();
+  await page.locator('textarea[data-key="compare-text"]').fill('Stream\tS1\tS4\nTemperature [C]\t185.6\t156.8\nPressure [bar]\t11.47\t4.9\n');
+  await page.locator('#workbook-body button', { hasText: 'Compare' }).click();
+  await page.waitForSelector('#workbook-body tbody tr');
+  check((await page.locator('#workbook-body tbody tr').count()) === 4, 'pasted HYSYS-style table compared stream by stream');
+  check((await page.locator('#workbook-body .band-good').count()) >= 2, 'close values are marked good');
+  if (SHOTS) await page.screenshot({ path: `${SHOTS}/e2e-compare.png` });
+
   console.log('Examples, save, other pages');
   await page.selectOption('#toolbar select', { label: 'Rankine cycle with closed feedwater heater' });
   await settle(page);
@@ -184,6 +247,20 @@ const status = (page) => page.locator('#statusbar').innerText();
   check((await page.locator('#page-relief .metric .v').nth(1).innerText()).trim() === 'L', 'relief page sizes the default case (L orifice)');
   check((await page.locator('#page-relief .katex').count()) > 5, 'relief steps render equations');
   if (SHOTS) await page.screenshot({ path: `${SHOTS}/e2e-relief.png`, fullPage: true });
+  await page.locator('#page-relief button', { hasText: 'Work it out (API 521 scenarios)' }).click();
+  await page.waitForTimeout(1000);
+  await page.selectOption('#page-relief select[data-key="rsc-add"]', 'cv_failure');
+  await page.locator('#page-relief input[data-key="rf-inlet_on"]').check();
+  await page.locator('#page-relief input[data-key="rf-outlet_on"]').check();
+  await page.waitForFunction(() => document.querySelector('#page-relief')?.innerText.includes('Reaction force'), null, { timeout: 30000 });
+  const relText = await page.locator('#page-relief .two-col > div:nth-child(2)').innerText();
+  check(/Governing scenario\s+(External fire|Control valve fails open)/.test(relText), 'relief page sizes several API 521 scenarios');
+  const govCard = await page.locator('#page-relief .scenario-card.governs').getAttribute('data-label');
+  check(relText.includes(`Governing scenario\n${govCard}`), `the governing scenario's card is highlighted (${govCard})`);
+  check(/Inlet pressure loss\s+[\d.]+ % of set/.test(relText) && relText.includes('Built-up back pressure'),
+    'relief page checks the inlet loss and the built-up back pressure');
+  const sizes = await page.$$eval('#page-relief select[data-key="rf-inlet-nps"] option', (o) => o.map((x) => x.value));
+  check(sizes[0] === '1/2' && sizes.indexOf('1-1/4') === sizes.indexOf('1') + 1, 'pipe sizes listed in order');
   await page.goto(`${BASE}/#/steam`);
   await page.waitForSelector('#page-steam .msg.ok');
   check((await page.locator('#page-steam .msg.ok').innerText()).includes('Superheated'), 'steam tables page shows a state');
