@@ -452,6 +452,17 @@ def P_sat(T: float) -> float:
     return _call(T=T + 273.15, x=0.0).P * 1000.0
 
 
+def surface_tension(T: float) -> float:
+    """Surface tension of water against its own vapour [N/m] at T [°C].
+
+    IAPWS R1-76 (2014): σ = B·τ^μ·(1 + b·τ) with τ = 1 − T/T_c, B = 235.8 mN/m,
+    b = −0.625, μ = 1.256, T_c = 647.096 K. Zero at and above the critical point."""
+    tau = 1.0 - (T + 273.15) / 647.096
+    if tau <= 0.0:
+        return 0.0
+    return 235.8e-3 * tau**1.256 * (1.0 - 0.625 * tau)
+
+
 def saturation_at_P(P: float) -> tuple[WaterState, WaterState]:
     """(saturated liquid, saturated vapour) at pressure P [kPa(a)]."""
     return state_Px(P, 0.0), state_Px(P, 1.0)

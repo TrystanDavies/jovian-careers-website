@@ -10,12 +10,16 @@ from ..hydraulics import (
     ROUGHNESS,
     SCHEDULES,
     TWO_PHASE_METHODS,
+    VOID_MODELS,
     HeatLoss,
+    PipeChokedError,
     fittings_k,
     fully_turbulent_friction,
     pipe_dimensions,
     pipe_flow,
+    two_phase_gradients,
     velocity_guidance,
+    void_fraction,
 )
 from ..relief import FLUIDS, OVERPRESSURE_BASES, VALVE_TYPES, ReliefInput, _overpressure, size_relief_valve
 from ..report import num, tex_text, unit
@@ -31,6 +35,31 @@ def _kj(v: float) -> str:
 
 
 # --- pipe segment -----------------------------------------------------------------------
+
+TWO_PHASE_TEXT = {
+    "Müller-Steinhagen & Heck": (
+        "The all-liquid and all-vapour friction gradients A and B are found at the total mass flux and combined "
+        "by the dryness fraction x.",
+        r"\left(\frac{dP}{dz}\right)_f = \left[A + 2(B - A)x\right](1 - x)^{1/3} + B x^3",
+        "Müller-Steinhagen & Heck (1986)"),
+    "Friedel": (
+        "The all-liquid gradient is multiplied by Friedel's two-phase multiplier, which depends on the density and "
+        "viscosity ratios, the Froude and Weber numbers (surface tension from IAPWS R1-76). Friction factors from "
+        "Colebrook. Valid for horizontal and upward flow.",
+        r"\left(\frac{dP}{dz}\right)_f = \Phi_{lo}^2\left(\frac{dP}{dz}\right)_{lo}, \quad "
+        r"\Phi_{lo}^2 = E + \frac{3.24\,F\,H}{Fr^{0.045}\,We^{0.035}}",
+        "Friedel (1979)"),
+    "Chisholm (Lockhart–Martinelli)": (
+        "Gradients for the liquid and the vapour each flowing alone in the pipe are combined with Chisholm's C "
+        "(20 if both phases are turbulent, 12 or 10 if one is laminar, 5 if both are; blended smoothly between).",
+        r"\left(\frac{dP}{dz}\right)_f = \left(\frac{dP}{dz}\right)_l + C\sqrt{\left(\frac{dP}{dz}\right)_l"
+        r"\left(\frac{dP}{dz}\right)_g} + \left(\frac{dP}{dz}\right)_g",
+        "Lockhart & Martinelli (1949); Chisholm (1967)"),
+    "Homogeneous": (
+        "Liquid and vapour are treated as one fluid with the mixture density and the Cicchitti mixture viscosity.",
+        r"\rho_h = \left(\frac{x}{\rho_g} + \frac{1 - x}{\rho_f}\right)^{-1}, \quad \mu_h = x\mu_g + (1 - x)\mu_f",
+        "Homogeneous equilibrium model"),
+}
 
 
 @register
@@ -74,12 +103,26 @@ class Pipe(Block):
               show_if=("heat_loss", ("Insulated", "Bare pipe")), group="Heat loss",
               help="Convection plus radiation from the outer surface; about 10 W/(m²·K) indoors."),
         Param("method", "Two-phase friction method", "choice", TWO_PHASE_METHODS[0], choices=TWO_PHASE_METHODS,
-              group="Method"),
+              group="Two-phase flow",
+              help="Müller-Steinhagen & Heck is the default and generally the most reliable for steam–water. "
+                   "The Results tab compares all methods."),
+        Param("void_model", "Void fraction (static head and acceleration)", "choice", VOID_MODELS[0],
+              choices=VOID_MODELS, group="Two-phase flow",
+              help="Drift flux accounts for steam slipping past the water, which raises the static head in "
+                   "rising wet lines (e.g. lifted condensate). New pipes use drift flux."),
+        Param("tp_factor", "Design factor on two-phase friction", "number", 1.0, min_value=0.1, max_value=5.0,
+              group="Two-phase flow",
+              help="Multiplies the two-phase friction gradient, e.g. 1.3 to allow for the correlations' "
+                   "typical ±30 % uncertainty. Single-phase flow is not affected."),
     ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._memo: dict = {}
+
+    def _sin_theta(self) -> float:
+        L = float(self.p("length"))
+        return min(max(float(self.p("elevation")) / L, -1.0), 1.0) if L > 0 else 0.0
 
     def dims(self) -> tuple[float, float]:
         if self.p("size_mode") == "Nominal size":
@@ -96,7 +139,7 @@ class Pipe(Block):
             return f'{self.p("nps")}" Sch {self.p("schedule")}, {fmt(self.p("length"), 3)} m'
         return f'ID {fmt(self.p("diameter"), 3)} mm, {fmt(self.p("length"), 3)} m'
 
-    def _run(self, m, P, h):
+    def _run(self, m, P, h, segments=None):
         d, od = self.dims()
         eps = self.roughness()
         k_fit, rows = fittings_k(self.p("fittings"), d)
@@ -106,20 +149,34 @@ class Pipe(Block):
             heat = HeatLoss(t_ambient=self.p("ambient"),
                             insulation_mm=self.p("ins_thickness") if self.p("heat_loss") == "Insulated" else 0.0,
                             k_insulation=self.p("ins_k"), h_outside=self.p("h_out"), od_mm=od)
-        key = (round(m, 12), round(P, 9), round(h, 9), repr(sorted(self.params.items(), key=lambda kv: kv[0])))
+        key = (round(m, 12), round(P, 9), round(h, 9), segments,
+               repr(sorted(self.params.items(), key=lambda kv: kv[0])))
         res = self._memo.get(key)
         if res is None:
-            res = pipe_flow(m, P, h, d, float(self.p("length")), eps, float(self.p("elevation")), k_total, heat,
-                            self.p("method"))
+            try:
+                res = pipe_flow(m, P, h, d, float(self.p("length")), eps, float(self.p("elevation")), k_total, heat,
+                                self.p("method"), segments=segments, void_model=self.p("void_model"),
+                                tp_factor=float(self.p("tp_factor")))
+            except (ValueError, WaterPropertyError) as exc:  # remember failures too: solvers retry the same inputs
+                res = exc
             if len(self._memo) > 64:
                 self._memo.clear()
             self._memo[key] = res
+        if isinstance(res, Exception):
+            raise res.with_traceback(None)
         return res, d, od, eps, k_total, rows
 
     def calculate(self):
         sin, out = self.s_in("in"), self.s_out("out")
         st1 = sin.state
-        res, d, od, eps, k_total, rows = self._run(sin.m, sin.P, sin.h)
+        try:
+            res, d, od, eps, k_total, rows = self._run(sin.m, sin.P, sin.h)
+        except PipeChokedError as exc:
+            r = exc.result
+            raise ValueError(
+                f"The flow is choked: at {fmt(sin.m * 3600, 4)} kg/h the velocity reaches the speed of sound "
+                f"{fmt(r.L_choke, 3)} m along this {fmt(self.p('length'), 3)} m pipe, so the pipe cannot pass this "
+                "flow from these inlet conditions. Increase the pipe size or shorten the run.") from exc
         out.set(sin.m, res.P_out, res.h_out)
         st2 = out.state
         self.heat_in = -res.heat_loss_kw
@@ -164,8 +221,23 @@ class Pipe(Block):
         elif st1.is_liquid_like and st2.phase == "two-phase":
             self.warn("The water flashes to steam in this pipe as the pressure falls.")
         wet = [st for st in (st1, st2) if st.phase == "two-phase" and 0.02 < st.x < 0.98]
+        g_flux = sin.m / (math.pi * (d / 1000.0) ** 2 / 4.0) if d > 0 else 0.0
+        compare = []  # (end, {method: gradient})
+        for label, st in (("inlet", st1), ("outlet", st2)):
+            grads = two_phase_gradients(st, g_flux, d, eps)
+            if grads:
+                compare.append((label, st, grads))
+        spread = None
+        if compare:
+            vals = [v for _, _, g in compare for v in g.values()]
+            rel = [max(g.values()) / min(g.values()) - 1.0 for _, _, g in compare if min(g.values()) > 0]
+            spread = max(rel) * 100.0 if rel else None
+            if spread is not None:
+                self.result("tp_spread", "Spread of two-phase friction methods", spread, "percent")
         if wet:
-            self.warn("Two-phase flow: pressure drop correlations are typically accurate to ±30 %.")
+            self.warn("Two-phase flow: friction correlations are typically accurate to about ±30 %"
+                      + (f"; here the methods differ by up to {fmt(spread, 2)} % (see 'Two-phase methods compared')."
+                         if spread is not None else "."))
 
         rows_fit = [["Fitting", "Number", "K each", "K total"]]
         rows_fit += [[lbl, fmt(cnt, 3), fmt(k, 3), fmt(k * cnt, 3)] for lbl, cnt, k in rows]
@@ -188,18 +260,37 @@ class Pipe(Block):
                       result=rf"Re = {num(res.re_in, 4)}, \quad f = {num(res.f_in, 4)}",
                       reference="Colebrook (1939); Darcy–Weisbach")
         if st1.phase == "two-phase" or res.two_phase:
-            self.step("Two-phase friction",
-                      text=(f"Method: {self.p('method')}. The all-liquid and all-vapour friction gradients A and B are "
-                            "found at the total mass flux and combined by the dryness fraction x."
-                            if self.p("method") != "Homogeneous" else
-                            "Method: homogeneous. Liquid and vapour are treated as one fluid with the mixture density "
-                            "and the Cicchitti mixture viscosity."),
-                      equation=(r"\left(\frac{dP}{dz}\right)_f = \left[A + 2(B - A)x\right](1 - x)^{1/3} + B x^3"
-                                if self.p("method") != "Homogeneous" else
-                                r"\rho_h = \left(\frac{x}{\rho_g} + \frac{1 - x}{\rho_f}\right)^{-1}, \quad "
-                                r"\mu_h = x\mu_g + (1 - x)\mu_f"),
-                      reference=("Müller-Steinhagen & Heck (1986)" if self.p("method") != "Homogeneous"
-                                 else "Homogeneous equilibrium model"))
+            text, eq, ref = TWO_PHASE_TEXT.get(self.p("method"), TWO_PHASE_TEXT[TWO_PHASE_METHODS[0]])
+            if float(self.p("tp_factor")) != 1.0:
+                text += f" The result is multiplied by the design factor {fmt(self.p('tp_factor'), 3)}."
+            self.step("Two-phase friction", text=f"Method: {self.p('method')}. " + text, equation=eq, reference=ref)
+            if self.p("void_model").startswith("Drift"):
+                st_tp = next((st for st in (st1, st2) if st.phase == "two-phase"), None)
+                alpha = void_fraction(st_tp, g_flux, self.p("void_model"), self._sin_theta()) if st_tp else None
+                self.step("Void fraction (static head and acceleration)",
+                          text=("Steam moves faster than the water (slip), so the water occupies more of the pipe than "
+                                "the no-slip (homogeneous) value. The drift-flux model gives the vapour volume "
+                                "fraction α; the static head uses ρ_m = αρ_g + (1 − α)ρ_f. C₀ = 1 + 0.12(1 − x) "
+                                "for horizontal pipes (Steiner), rising to 1 + 0.2(1 − x) for vertical upflow "
+                                "(Rouhani–Axelsson); downward flow uses the homogeneous value."),
+                          equation=(r"\alpha = \frac{x/\rho_g}{C_0\left(\frac{x}{\rho_g} + \frac{1-x}{\rho_f}\right)"
+                                    r" + \frac{1.18(1-x)\left[g\sigma(\rho_f - \rho_g)\right]^{1/4}}{G\,\rho_f^{1/2}}}"),
+                          result=(rf"\alpha = {num(alpha, 4)}" + tex_text(" (where the flow first becomes two-phase)")
+                                  if alpha is not None else None),
+                          reference="Rouhani & Axelsson (1970); Steiner (1993), VDI Heat Atlas")
+            if compare:
+                header = ["Method"] + [f"Friction gradient at {lbl} (kPa per 100 m)" for lbl, _, _ in compare]
+                table = [header]
+                for meth in TWO_PHASE_METHODS:
+                    table.append([meth + (" (used)" if meth == self.p("method") else "")]
+                                 + [fmt(g[meth] / 10.0, 4) for _, _, g in compare])
+                self.step("Two-phase methods compared",
+                          text=("Frictional pressure gradient by each correlation at the same conditions "
+                                f"(dryness {', '.join(fmt(st.x, 3) for _, st, _ in compare)}). The spread between "
+                                "them indicates the uncertainty of the two-phase pressure drop"
+                                + (f": {fmt(spread, 2)} % here." if spread is not None else ".")),
+                          table=table,
+                          reference="Müller-Steinhagen & Heck (1986); Friedel (1979); Chisholm (1967)")
         self.step("Fittings",
                   text=("Resistance coefficients from Crane TP-410: K = (L/D)·f_T, where f_T = "
                         f"{fmt(fully_turbulent_friction(d), 3)} is the fully turbulent friction factor of clean steel "
@@ -209,9 +300,13 @@ class Pipe(Block):
                   table=rows_fit if len(rows_fit) > 2 else None,
                   reference="Crane Technical Paper 410")
         self.step("Pressure drop along the pipe",
-                  text=(f"The pipe is divided into {res.segments} segment(s). In each, properties are updated from "
+                  text=(f"The pipe is calculated in {res.segments} step(s). In each, properties are updated from "
                         "IAPWS-IF97 and the friction, fittings, static head and acceleration terms are added. "
-                        "Energy balance per segment: heat loss, elevation and kinetic energy change the enthalpy."),
+                        "Energy balance per step: heat loss, elevation and kinetic energy change the enthalpy. "
+                        "Where the Mach number exceeds 0.6 the march continues in small pressure steps, so that "
+                        "choking (velocity reaching the speed of sound) is found exactly"
+                        + (" (for wet steam the homogeneous-equilibrium speed of sound is used, which is "
+                           "conservative)." if res.two_phase else ".")),
                   equation=(r"\Delta P = \underbrace{\sum f\frac{\Delta L}{D}\frac{\rho v^2}{2}}_{friction}"
                             r" + \Delta P_K + \underbrace{\sum \rho g \Delta z}_{static} + "
                             r"\underbrace{G^2\left(\frac{1}{\rho_{out}} - \frac{1}{\rho_{in}}\right)}_{acceleration}"),

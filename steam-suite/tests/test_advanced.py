@@ -186,3 +186,22 @@ def test_case_study_and_layout_round_trip():
     assert fs.blocks["Supply"].params["flow"] == pytest.approx(10 / 3.6)
     fs2 = Flowsheet.from_json(fs.to_json())
     assert fs2.layout == fs.layout
+
+
+def test_pipe_block_compares_two_phase_methods_and_reports_choking():
+    fs = Flowsheet("wet line")
+    fs.add(Feed("Wet", outlets={"out": "W1"}, params={"pressure": 300.0, "condition": "Dryness fraction",
+                                                     "dryness": 0.1, "flow": 0.5}))
+    fs.add(Pipe("Riser", inlets={"in": "W1"}, outlets={"out": "W2"},
+                params={"nps": "3", "length": 20.0, "elevation": 5.0, "void_model": "Drift flux (Rouhani–Axelsson)",
+                        "tp_factor": 1.3}))
+    res = fs.solve()
+    assert res.converged, res.errors
+    blk = fs.blocks["Riser"]
+    titles = [s.title for s in blk.steps]
+    assert "Two-phase methods compared" in titles and "Void fraction (static head and acceleration)" in titles
+    assert blk.results["tp_spread"].value > 0
+    # a far too small pipe: a clear choking message, not a numerical failure
+    blk.params.update({"nps": "1", "length": 100.0})
+    res = fs.solve()
+    assert any("choked" in e and "speed of sound" in e for e in res.errors)
