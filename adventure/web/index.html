@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Colossal Cave</title>
+<meta name="description" content="Colossal Cave Adventure, reworked: an amber VT-100 terminal, a map that draws itself, an itinerary, and pictures in Lowry's five colours.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23F3EFE2'/%3E%3Crect x='3' y='7' width='10' height='8' fill='%23D2381F'/%3E%3Cpolygon points='1,8 8,2 15,8' fill='%231F1C19'/%3E%3Crect x='7' y='10' width='2' height='5' fill='%231F1C19'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="brand">
+    <span class="swatch" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    <h1>Colossal Cave</h1>
+    <span class="tag">an Advent in five colours</span>
+  </div>
+  <nav class="controls" aria-label="Game controls">
+    <label class="baud">Line
+      <select id="baud" aria-label="Line speed">
+        <option value="300">300 baud</option>
+        <option value="1200">1200 baud</option>
+        <option value="2400">2400 baud</option>
+        <option value="9600">9600 baud</option>
+        <option value="0">instant</option>
+      </select>
+    </label>
+    <button type="button" data-cmd="help">Help</button>
+    <button type="button" data-cmd="hint">Hint</button>
+    <button type="button" data-cmd="undo">Undo</button>
+    <button type="button" id="new-game">New game</button>
+  </nav>
+</header>
+
+<main class="desk">
+  <section class="win scene" id="win-scene" aria-label="Scene">
+    <header class="titlebar"><span class="dot"></span><h2>Scene</h2><span class="caption" id="scene-caption"></span><button type="button" class="min" aria-label="Minimise">&ndash;</button></header>
+    <div class="body"><figure class="frame" id="scene" role="img" aria-label="Picture of the current location"></figure></div>
+  </section>
+
+  <section class="win map" id="win-map" aria-label="Map">
+    <header class="titlebar"><span class="dot"></span><h2>Map</h2><span class="caption" id="map-caption"></span><button type="button" class="min" aria-label="Minimise">&ndash;</button></header>
+    <div class="tabs" id="map-tabs" role="tablist"></div>
+    <div class="body map-body" id="map"></div>
+    <footer class="compass" id="compass" aria-label="Exits">
+      <div class="rose">
+        <button type="button" data-dir="nw">NW</button><button type="button" data-dir="n">N</button><button type="button" data-dir="ne">NE</button>
+        <button type="button" data-dir="w">W</button><button type="button" class="hub" data-cmd="look">LOOK</button><button type="button" data-dir="e">E</button>
+        <button type="button" data-dir="sw">SW</button><button type="button" data-dir="s">S</button><button type="button" data-dir="se">SE</button>
+      </div>
+      <div class="updown">
+        <button type="button" data-dir="u">UP</button>
+        <button type="button" data-dir="d">DOWN</button>
+        <button type="button" data-cmd="back">BACK</button>
+      </div>
+      <p class="legend"><span class="key here"></span>you <span class="key gold"></span>treasure seen <span class="key stub"></span>untried</p>
+    </footer>
+  </section>
+
+  <section class="win term" id="win-term" aria-label="Terminal">
+    <header class="titlebar"><span class="dot"></span><h2>Terminal</h2><span class="caption">VT-100 &middot; <span id="baud-caption">2400 baud</span></span></header>
+    <div class="bezel">
+      <div class="crt" id="crt">
+        <div class="status" id="status"></div>
+        <div class="screen" id="screen" aria-live="polite"></div>
+        <div class="inputline">
+          <span class="prompt">&gt;</span>
+          <span class="field">
+            <span class="mirror" aria-hidden="true"><span id="m-before"></span><span class="cursor" id="m-cursor">&nbsp;</span><span id="m-after"></span></span>
+            <input id="cmd" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send" aria-label="Command">
+          </span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="stack">
+    <section class="win itin" id="win-itin" aria-label="Itinerary">
+      <header class="titlebar"><span class="dot"></span><h2>Itinerary</h2><span class="caption" id="itin-caption"></span><button type="button" class="min" aria-label="Minimise">&ndash;</button></header>
+      <div class="body">
+        <div class="treasures" id="treasures"></div>
+        <ol class="log" id="log"></ol>
+      </div>
+    </section>
+    <section class="win inv" id="win-inv" aria-label="Inventory">
+      <header class="titlebar"><span class="dot"></span><h2>Inventory</h2><span class="caption" id="inv-caption"></span><button type="button" class="min" aria-label="Minimise">&ndash;</button></header>
+      <div class="body">
+        <div class="meters" id="meters"></div>
+        <ul class="items" id="items"></ul>
+      </div>
+    </section>
+  </div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
